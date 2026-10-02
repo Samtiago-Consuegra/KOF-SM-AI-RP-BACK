@@ -1,0 +1,17 @@
+# API
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+python-dotenv==1.0.1
+# Base de datos (Supabase / PostgreSQL)
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+# Datos
+pandas==2.2.3
+openpyxl==3.1.5
+xlrd==2.0.1
+# Motor de predicción (kof_engine). scikit-learn fijado: el modelo guardado depende de su versión.
+numpy==2.2.1
+scipy==1.14.1
+scikit-learn==1.6.0
+joblib==1.4.2

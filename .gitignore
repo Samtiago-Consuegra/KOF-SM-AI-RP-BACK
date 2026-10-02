@@ -1,0 +1,41 @@
+# Environments
+.env
+.venv
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs and databases
+*.log
+uvicorn.pid
+uvicorn.err.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Modelos entrenados (viven en la base de datos, no en el repo)
+*.joblib
+resultados.json
