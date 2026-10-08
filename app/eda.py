@@ -77,6 +77,46 @@ def by_day(df: pd.DataFrame, start: date, end: date) -> list:
     ]
 
 
+def by_day_machine(df: pd.DataFrame) -> list:
+    """Paros y minutos por día y máquina. No rellena ceros: las gráficas de evolución
+    arman la matriz día × máquina por su cuenta y así el payload se mantiene pequeño."""
+    if df.empty:
+        return []
+    grouped = (
+        df.groupby(["event_date", "machine"], dropna=False)
+        .agg(count=("id", "count"), total_minutes=("stop_minutes", "sum"))
+        .reset_index()
+    )
+    return [
+        {
+            "date": r["event_date"].date().isoformat(),
+            "machine": r["machine"],
+            "count": int(r["count"]),
+            "total_minutes": float(round(r["total_minutes"], 2)),
+            "critical": r["machine"] in CRITICAL_MACHINES,
+        }
+        for _, r in grouped.iterrows()
+    ]
+
+
+def available_periods(dates) -> dict:
+    """Meses con paros registrados y el rango real de la base.
+
+    Alimenta el selector de mes y los límites del calendario del frontend: el histórico
+    arranca en 2024, así que un rango fijo de "hoy hacia atrás" dejaría fuera casi todo.
+    Acepta cualquier iterable de `date`; el router le pasa solo esa columna, sin cargar el resto.
+    """
+    days = [d.date() if hasattr(d, "date") else d for d in dates]
+    if not days:
+        return {"empty": True, "min": None, "max": None, "months": []}
+    return {
+        "empty": False,
+        "min": min(days).isoformat(),
+        "max": max(days).isoformat(),
+        "months": sorted({f"{d.year:04d}-{d.month:02d}" for d in days}),
+    }
+
+
 def by_machine(df: pd.DataFrame) -> list:
     grouped = df.groupby("machine", dropna=False).agg(
         count=("id", "count"),
@@ -225,10 +265,16 @@ def build_summary(full: pd.DataFrame, machines: list[str] | None, period: str = 
         "data_range": data_range,
         "kpis": kpis(df, full, start, end),
         "by_day": by_day(df, start, end),
+        "by_day_machine": by_day_machine(df),
     }
     if df.empty:
+        # El Excel suele ir atrasado respecto a hoy, así que el caso "no hay paros en el rango"
+        # casi siempre significa "todavía no han llegado los datos de esas fechas".
+        last = full["event_date"].max().date()
         return {**result, "machines": [], "top_failures": [], "monthly_trend": [], "shifts": [],
-                "avg_duration": [], "scatter": [], "mtbf": []}
+                "avg_duration": [], "scatter": [], "mtbf": [],
+                "message": f"Sin paros entre {start.isoformat()} y {end.isoformat()}. "
+                           f"El último registro es del {last.isoformat()}."}
     return {
         **result,
         "machines": by_machine(df),

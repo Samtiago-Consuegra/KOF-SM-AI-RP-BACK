@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..constants import CRITICAL_MACHINES
 from ..db import get_db
-from ..eda import build_summary, df_from_event_rows
+from ..eda import available_periods, build_summary, df_from_event_rows
 from ..models import FailureEvent
 
 router = APIRouter(tags=["eda"])
@@ -33,6 +33,16 @@ def _parse_machines(machines: str | None) -> list[str] | None:
     if machines == "criticas":
         return CRITICAL_MACHINES
     return [m.strip() for m in machines.split(",") if m.strip()]
+
+
+@router.get("/eda/periodos")
+def eda_periodos(db: Session = Depends(get_db)):
+    """Meses que tienen paros registrados + límites del calendario.
+
+    Consulta ligera: solo la columna de fechas, sin el resto del evento.
+    """
+    dates = db.execute(select(FailureEvent.event_date).distinct()).scalars().all()
+    return available_periods(dates)
 
 
 @router.get("/eda/summary")
