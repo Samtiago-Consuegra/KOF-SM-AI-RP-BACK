@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import ModelArtifact, PredictionRun
-from ..prediction_service import create_run, run_engine
+from ..prediction_service import calcular_snapshot, create_run, run_engine
 
 router = APIRouter(prefix="/predicciones", tags=["predicciones"])
 
@@ -24,9 +24,27 @@ def _run_status(run: PredictionRun | None) -> dict | None:
 def latest_predictions(
     include: str | None = Query(None, description="Secciones separadas por coma. Por defecto todas: "
                                                    "meta,ipm,regimen,pronostico,tablero,matriz,historico_ipm"),
+    hasta: str | None = Query(None, description="Corte YYYY-MM-DD (día/semana/mes): recalcula TODA la matriz "
+                                                "con los datos disponibles hasta esa fecha."),
     db: Session = Depends(get_db),
 ):
-    """Último resultado exitoso del motor + estado de la ejecución más reciente."""
+    """Último resultado exitoso del motor + estado de la ejecución más reciente.
+
+    Con `hasta` no devuelve una ejecución guardada, sino una reconstrucción al corte
+    (IPM, semáforo, pronósticos y tendencia diaria con datos ≤ `hasta`)."""
+    if hasta:
+        try:
+            results = calcular_snapshot(db, hasta)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if results.get("available") is False:
+            return {"available": False, "latest_run": None, "message": results.get("message", "Sin predicciones")}
+        if include:
+            wanted = {s.strip() for s in include.split(",")} & SECTIONS
+            results = {k: v for k, v in results.items() if k in wanted}
+        results.pop("probabilidades", None)
+        return {"available": True, "run": None, "hasta": hasta, **results}
+
     latest = db.scalars(select(PredictionRun).order_by(PredictionRun.id.desc()).limit(1)).first()
     ok = db.scalars(select(PredictionRun).where(PredictionRun.status == "ok")
                     .order_by(PredictionRun.id.desc()).limit(1)).first()

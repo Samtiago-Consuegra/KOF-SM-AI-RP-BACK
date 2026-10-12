@@ -8,7 +8,7 @@ import pandas as pd
 
 from . import config as C
 from .confiabilidad import nivel_semanal, weibull_envolvedora
-from .datos import construir_variables, preparar_base
+from .datos import DatosInvalidos, construir_variables, preparar_base
 from .ipm import calcular_ipm
 from .pronostico import pronosticar_turno
 from .regimen import carta_p, carta_p_json, estado_regimen
@@ -34,7 +34,7 @@ def a_json_nativo(obj):
 
 
 def generar_resultados(df_sap: pd.DataFrame, art: dict, incluir_carta: bool = True,
-                       sensibilidad: bool = True) -> dict:
+                       sensibilidad: bool = True, fin: pd.Timestamp | None = None) -> dict:
     """Calcula IPM, régimen, pronósticos y la vista integrada del tablero.
 
     Parámetros
@@ -42,11 +42,18 @@ def generar_resultados(df_sap: pd.DataFrame, art: dict, incluir_carta: bool = Tr
         art           artefacto de modelos.entrenar() / cargar_artefacto().
         incluir_carta incluir la serie semanal de la carta p (para graficar en el frontend).
         sensibilidad  calcular la robustez Monte Carlo del IPM (≈ 1 s).
+        fin           fecha de corte opcional (YYYY-MM-DD o Timestamp): usa SOLO los datos ≤ fin.
+                      Sin fin, usa todo el histórico (último día = max de la base).
 
     Devuelve un dict serializable a JSON con las claves: meta, ipm, regimen, pronostico, tablero,
     probabilidades (valores sin redondear, para modelos.recalcular_cortes).
     """
     base = preparar_base(df_sap)
+    if fin is not None:
+        base = base[base["Fecha"] <= pd.Timestamp(fin)]
+        if base.empty:
+            raise DatosInvalidos(f"No hay datos de P.EQ.LINEA hasta el corte {pd.Timestamp(fin).date()}.")
+        base = base.reset_index(drop=True)
     variables = construir_variables(base)
 
     ipm = calcular_ipm(base, con_sensibilidad=sensibilidad)

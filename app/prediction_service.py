@@ -65,12 +65,16 @@ def _artifact_metrics(art: dict) -> dict:
 
 
 # --- Vista simplificada para la matriz predictiva del frontend -----------------------------------
-def build_matrix(results: dict, ipm_history: pd.DataFrame) -> list[dict]:
-    """Una fila por máquina con lo que necesita la tabla 'Matriz predictiva de equipos'."""
+def build_matrix(results: dict, ipm_history: pd.DataFrame, trend_pts: int = TREND_WEEKS) -> list[dict]:
+    """Una fila por máquina con lo que necesita la tabla 'Matriz predictiva de equipos'.
+
+    `ipm_history` puede ser semanal (11-12 puntos) o diaria (últimas CLIENTE_SEMANAS semanas);
+    `trend_pts` fija cuántos puntos de la serie usa como tendencia de la fila.
+    """
     rows = []
     for item in results["tablero"]:
         m, p = item["Maquina"], item["Pronostico"]
-        hist = ipm_history[ipm_history["Maquina"] == m].tail(TREND_WEEKS)
+        hist = ipm_history[ipm_history["Maquina"] == m].tail(trend_pts)
         trend = [{"k": i, "date": r["Fecha_corte"], "v": r["IPM"]} for i, (_, r) in enumerate(hist.iterrows())]
         first, last = (trend[0]["v"], trend[-1]["v"]) if trend else (0, 0)
 
@@ -107,6 +111,45 @@ def build_matrix(results: dict, ipm_history: pd.DataFrame) -> list[dict]:
 def _prune_artifacts(db: Session) -> None:
     keep = db.scalars(select(ModelArtifact.id).order_by(ModelArtifact.id.desc()).limit(KEEP_ARTIFACTS)).all()
     db.execute(delete(ModelArtifact).where(ModelArtifact.id.not_in(keep)))
+
+
+# --- Reconstrucción histórica (corte en `hasta`) -------------------------------------------------
+_SNAPSHOT_CACHE: dict[str, dict] = {}
+SNAPSHOT_CACHE_MAX = 60
+
+
+def clear_snapshot_cache() -> None:
+    _SNAPSHOT_CACHE.clear()
+
+
+def calcular_snapshot(db: Session, hasta: str) -> dict:
+    """Recalcula TODA la matriz como si `hasta` (día/semana/mes) fuera el último dato disponible.
+
+    Reusa el último artefacto (sin reentrenar), la tendencia se entrega a resolución diaria
+    (últimas 12 semanas) y el resultado se cachea por fecha de corte.
+    """
+    key = str(pd.Timestamp(hasta).date())
+    if key in _SNAPSHOT_CACHE:
+        return _SNAPSHOT_CACHE[key]
+
+    df = events_to_sap_dataframe(db)
+    if df.empty:
+        return {"available": False, "message": "No hay paros cargados. Sube un Excel SAP primero."}
+    art_row = db.scalars(select(ModelArtifact).order_by(ModelArtifact.id.desc()).limit(1)).first()
+    if art_row is None:
+        return {"available": False,
+                "message": "Aún no hay predicciones. Sube un Excel SAP o ejecuta POST /predicciones/ejecutar."}
+
+    art = _load_artifact(art_row.data)
+    results = generar_resultados(df, art, incluir_carta=False, sensibilidad=False, fin=hasta)
+    history = historico_ipm(preparar_base(df), hasta=hasta, diario=True)
+    results["historico_ipm"] = history.to_dict(orient="records")
+    results["matriz"] = build_matrix(results, history, trend_pts=TREND_WEEKS * 7)
+    out = a_json_nativo(results)
+    _SNAPSHOT_CACHE[key] = out
+    if len(_SNAPSHOT_CACHE) > SNAPSHOT_CACHE_MAX:
+        _SNAPSHOT_CACHE.pop(next(iter(_SNAPSHOT_CACHE)))
+    return out
 
 
 # --- Ejecución del motor -------------------------------------------------------------------------
@@ -153,6 +196,7 @@ def run_engine(run_id: int, retrain: bool = True) -> None:
             run.artifact_id = artifact_row.id
             run.status = "ok"
             _prune_artifacts(db)
+            clear_snapshot_cache()
         except Exception as exc:                                     # noqa: BLE001
             log.error("Fallo del motor (run %s): %s", run_id, traceback.format_exc())
             db.rollback()

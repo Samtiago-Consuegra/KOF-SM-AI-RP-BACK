@@ -119,11 +119,23 @@ def calcular_ipm(base: pd.DataFrame, fin: pd.Timestamp | None = None, con_sensib
             "maquinas": maquinas}
 
 
-def historico_ipm(base: pd.DataFrame, desde: str = "2025-01-05") -> pd.DataFrame:
-    """IPM semana a semana (ventana móvil) para guardar en la base de datos y graficar su evolución."""
+def historico_ipm(base: pd.DataFrame, desde: str = "2025-01-05", hasta: str | None = None,
+                  diario: bool = False) -> pd.DataFrame:
+    """IPM por corte (ventana móvil) para guardar en la base de datos y graficar su evolución.
+
+    diario=False → un corte por semana (domingos). diario=True → un corte por cada día con datos
+    de las últimas VENTANA_SEMANAS semanas (para ver la evolución a resolución de día).
+    `hasta` limita el último corte (no puede ser posterior al último día con datos).
+    """
     b = marcar_recurrencia(base)
     fin_max = b["Fecha"].max()
-    cortes = pd.date_range(desde, fin_max, freq="W-SUN")
+    if hasta is not None:
+        fin_max = min(fin_max, pd.Timestamp(hasta))
+    if diario:
+        dias = b.loc[b["Fecha"] <= fin_max, "Fecha"].drop_duplicates().sort_values()
+        cortes = pd.DatetimeIndex(dias[dias >= fin_max - pd.Timedelta(weeks=C.VENTANA_SEMANAS)])
+    else:
+        cortes = pd.date_range(desde, fin_max, freq="W-SUN")
     if len(cortes) == 0 or cortes[-1] != fin_max:
         cortes = cortes.append(pd.DatetimeIndex([fin_max]))
     filas = []
