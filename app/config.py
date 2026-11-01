@@ -22,6 +22,12 @@ class Settings:
         for o in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
         if o.strip()
     ]
+    secret_key: str = os.getenv(
+        "SECRET_KEY",
+        "9b8f62a7e41c803d92675abf812c963e704da582961cf73ab826915d704c3928",
+    )
+    algorithm: str = os.getenv("ALGORITHM", "HS256")
+    access_token_expire_minutes: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
 
 
 settings = Settings()

@@ -1,8 +1,22 @@
-from sqlalchemy import (Column, Date, DateTime, ForeignKey, Integer, LargeBinary, Numeric, String,
+from sqlalchemy import (Boolean, Column, Date, DateTime, ForeignKey, Integer, LargeBinary, Numeric, String,
                         Text, func)
 from sqlalchemy.dialects.postgresql import JSONB
 
 from .db import Base
+
+
+class User(Base):
+    """Usuarios registrados para acceder a la plataforma."""
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    full_name = Column(String(150))
+    hashed_password = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class FailureEvent(Base):

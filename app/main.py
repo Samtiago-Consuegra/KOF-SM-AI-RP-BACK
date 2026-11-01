@@ -7,7 +7,7 @@ from sqlalchemy import text
 from .config import settings
 from .db import Base, engine
 from .prediction_service import mark_interrupted_runs
-from .routers import eda, predicciones, upload
+from .routers import auth, eda, predicciones, upload
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -21,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-TABLES = ["failure_events", "data_loads", "model_artifacts", "prediction_runs"]
+TABLES = ["users", "failure_events", "data_loads", "model_artifacts", "prediction_runs"]
 
 
 @app.on_event("startup")
@@ -40,6 +40,7 @@ def health():
     return {"status": "ok"}
 
 
+app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(upload.router)
 app.include_router(eda.router)
 app.include_router(predicciones.router)
