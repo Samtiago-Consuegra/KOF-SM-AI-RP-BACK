@@ -1,3 +1,5 @@
+import threading
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -10,8 +12,17 @@ router = APIRouter(prefix="/predicciones", tags=["predicciones"])
 
 SECTIONS = {"meta", "ipm", "regimen", "pronostico", "tablero", "matriz", "historico_ipm"}
 
+# Estado del último run "ok": se evita transferir su JSONB `results` en cada petición.
+_LATEST_OK_LOCK = threading.Lock()
+_latest_ok: dict = {"run_id": None, "status": None, "results": None}
 
-def _run_status(run: PredictionRun | None) -> dict | None:
+_RUN_STATUS_COLS = (
+    PredictionRun.id, PredictionRun.status, PredictionRun.trigger, PredictionRun.error,
+    PredictionRun.created_at, PredictionRun.finished_at, PredictionRun.data_until,
+)
+
+
+def _run_status(run) -> dict | None:
     if run is None:
         return None
     return {"id": run.id, "status": run.status, "trigger": run.trigger, "error": run.error,
@@ -45,19 +56,33 @@ def latest_predictions(
         results.pop("probabilidades", None)
         return {"available": True, "run": None, "hasta": hasta, **results}
 
-    latest = db.scalars(select(PredictionRun).order_by(PredictionRun.id.desc()).limit(1)).first()
-    ok = db.scalars(select(PredictionRun).where(PredictionRun.status == "ok")
-                    .order_by(PredictionRun.id.desc()).limit(1)).first()
-    if ok is None:
+    latest = db.execute(
+        select(*_RUN_STATUS_COLS).order_by(PredictionRun.id.desc()).limit(1)
+    ).first()
+    ok_id = db.scalar(
+        select(PredictionRun.id).where(PredictionRun.status == "ok")
+        .order_by(PredictionRun.id.desc()).limit(1)
+    )
+    if ok_id is None:
         return {"available": False, "latest_run": _run_status(latest),
                 "message": "Aún no hay predicciones. Sube un Excel SAP o ejecuta POST /predicciones/ejecutar."}
 
-    results = ok.results
+    with _LATEST_OK_LOCK:
+        if _latest_ok["run_id"] != ok_id:
+            ok_row = db.execute(
+                select(*_RUN_STATUS_COLS).where(PredictionRun.id == ok_id)
+            ).first()
+            ok_results = db.scalar(select(PredictionRun.results).where(PredictionRun.id == ok_id)) or {}
+            _latest_ok.update({"run_id": ok_id, "status": _run_status(ok_row), "results": ok_results})
+        ok_status = _latest_ok["status"]
+        cached_results = _latest_ok["results"]
+
+    results = dict(cached_results)               # copia: no mutar la caché al quitar secciones
     if include:
         wanted = {s.strip() for s in include.split(",")} & SECTIONS
         results = {k: v for k, v in results.items() if k in wanted}
     results.pop("probabilidades", None)          # dato interno del motor
-    return {"available": True, "run": _run_status(ok), "latest_run": _run_status(latest), **results}
+    return {"available": True, "run": ok_status, "latest_run": _run_status(latest), **results}
 
 
 @router.get("/estado")

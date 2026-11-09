@@ -5,24 +5,22 @@ Flujo:
      reporte SAP que espera el motor (el motor necesita el histórico completo, no solo lo nuevo).
   2. run_engine(): entrena (o reutiliza el último modelo), genera resultados y los guarda en
      prediction_runs. Se ejecuta en segundo plano porque entrenar tarda de segundos a ~1 min.
+
+Los imports pesados (joblib, sklearn, kof_engine) se hacen dentro de las funciones que los usan
+para que el servidor arranque sin cargarlos.
 """
 import io
 import logging
 import threading
 import traceback
+from collections import OrderedDict
 from datetime import datetime, timezone
 
-import joblib
 import pandas as pd
-import sklearn
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
-from kof_engine import config as engine_config
-from kof_engine import entrenar, generar_resultados, preparar_base
-from kof_engine.ipm import historico_ipm
-from kof_engine.pipeline import a_json_nativo
-
+from .cache import data_version
 from .db import SessionLocal
 from .models import FailureEvent, ModelArtifact, PredictionRun
 
@@ -36,6 +34,8 @@ TREND_WEEKS = 12
 
 # --- BD -> DataFrame con formato SAP --------------------------------------------------------------
 def events_to_sap_dataframe(db: Session) -> pd.DataFrame:
+    from kof_engine import config as engine_config
+
     rows = db.execute(select(
         FailureEvent.event_date, FailureEvent.shift, FailureEvent.interval, FailureEvent.machine,
         FailureEvent.subsystem, FailureEvent.failure_type, FailureEvent.stop_minutes, FailureEvent.crew,
@@ -49,12 +49,16 @@ def events_to_sap_dataframe(db: Session) -> pd.DataFrame:
 
 # --- Artefacto (modelos entrenados) <-> bytes ----------------------------------------------------
 def _dump_artifact(art: dict) -> bytes:
+    import joblib
+
     buffer = io.BytesIO()
     joblib.dump(art, buffer, compress=3)
     return buffer.getvalue()
 
 
 def _load_artifact(data: bytes) -> dict:
+    import joblib
+
     return joblib.load(io.BytesIO(data))
 
 
@@ -114,41 +118,55 @@ def _prune_artifacts(db: Session) -> None:
 
 
 # --- Reconstrucción histórica (corte en `hasta`) -------------------------------------------------
-_SNAPSHOT_CACHE: dict[str, dict] = {}
-SNAPSHOT_CACHE_MAX = 60
+_SNAPSHOT_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_SNAPSHOT_LOCK = threading.Lock()
+SNAPSHOT_CACHE_MAX = 16
 
 
 def clear_snapshot_cache() -> None:
-    _SNAPSHOT_CACHE.clear()
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_CACHE.clear()
 
 
 def calcular_snapshot(db: Session, hasta: str) -> dict:
     """Recalcula TODA la matriz como si `hasta` (día/semana/mes) fuera el último dato disponible.
 
     Reusa el último artefacto (sin reentrenar), la tendencia se entrega a resolución diaria
-    (últimas 12 semanas) y el resultado se cachea por fecha de corte.
+    (últimas 12 semanas). El resultado se cachea por (versión de datos, último modelo, corte).
     """
-    key = str(pd.Timestamp(hasta).date())
-    if key in _SNAPSHOT_CACHE:
-        return _SNAPSHOT_CACHE[key]
+    key_date = str(pd.Timestamp(hasta).date())
+    last_model_id = db.scalar(select(ModelArtifact.id).order_by(ModelArtifact.id.desc()).limit(1))
+    key = (data_version(db), last_model_id, key_date)
+
+    with _SNAPSHOT_LOCK:
+        cached = _SNAPSHOT_CACHE.get(key)
+        if cached is not None:
+            _SNAPSHOT_CACHE.move_to_end(key)
+            return cached
 
     df = events_to_sap_dataframe(db)
     if df.empty:
         return {"available": False, "message": "No hay paros cargados. Sube un Excel SAP primero."}
-    art_row = db.scalars(select(ModelArtifact).order_by(ModelArtifact.id.desc()).limit(1)).first()
-    if art_row is None:
+    if last_model_id is None:
         return {"available": False,
                 "message": "Aún no hay predicciones. Sube un Excel SAP o ejecuta POST /predicciones/ejecutar."}
 
-    art = _load_artifact(art_row.data)
+    from kof_engine import generar_resultados, preparar_base
+    from kof_engine.ipm import historico_ipm
+    from kof_engine.pipeline import a_json_nativo
+
+    art = _load_artifact(db.get(ModelArtifact, last_model_id).data)
     results = generar_resultados(df, art, incluir_carta=False, sensibilidad=False, fin=hasta)
     history = historico_ipm(preparar_base(df), hasta=hasta, diario=True)
     results["historico_ipm"] = history.to_dict(orient="records")
     results["matriz"] = build_matrix(results, history, trend_pts=TREND_WEEKS * 7)
     out = a_json_nativo(results)
-    _SNAPSHOT_CACHE[key] = out
-    if len(_SNAPSHOT_CACHE) > SNAPSHOT_CACHE_MAX:
-        _SNAPSHOT_CACHE.pop(next(iter(_SNAPSHOT_CACHE)))
+
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_CACHE[key] = out
+        _SNAPSHOT_CACHE.move_to_end(key)
+        while len(_SNAPSHOT_CACHE) > SNAPSHOT_CACHE_MAX:
+            _SNAPSHOT_CACHE.popitem(last=False)
     return out
 
 
@@ -166,6 +184,11 @@ def run_engine(run_id: int, retrain: bool = True) -> None:
     with _engine_lock, SessionLocal() as db:
         run = db.get(PredictionRun, run_id)
         try:
+            import sklearn
+            from kof_engine import entrenar, generar_resultados, preparar_base
+            from kof_engine.ipm import historico_ipm
+            from kof_engine.pipeline import a_json_nativo
+
             df = events_to_sap_dataframe(db)
             if df.empty:
                 raise ValueError("No hay paros cargados. Sube un Excel SAP primero.")

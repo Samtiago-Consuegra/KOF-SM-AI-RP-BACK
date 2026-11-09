@@ -6,7 +6,9 @@ from passlib.context import CryptContext
 
 from ..config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Rondas 10: suficiente para producción y notablemente más rápido que el valor por defecto (12).
+# Los hashes viejos se rehashean solos en el siguiente login (pwd_context.needs_update).
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=10)
 
 
 def get_password_hash(password: str) -> str:

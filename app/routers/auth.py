@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -5,7 +7,9 @@ from ..db import get_db
 from ..deps import get_current_user
 from ..models import User
 from ..schemas.auth import Token, UserCreate, UserLogin, UserOut
-from ..utils.security import create_access_token, get_password_hash, verify_password
+from ..utils.security import create_access_token, get_password_hash, pwd_context, verify_password
+
+log = logging.getLogger("kof.auth")
 
 router = APIRouter()
 
@@ -41,6 +45,15 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
         )
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Usuario inactivo")
+
+    # Migración transparente: si el hash se guardó con menos rondas, se actualiza al iniciar sesión.
+    if pwd_context.needs_update(user.hashed_password):
+        try:
+            user.hashed_password = get_password_hash(credentials.password)
+            db.commit()
+        except Exception:  # noqa: BLE001 - un fallo de rehash no debe impedir el login
+            db.rollback()
+            log.warning("No se pudo rehashear la contraseña de %s", user.email, exc_info=True)
 
     access_token = create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer"}

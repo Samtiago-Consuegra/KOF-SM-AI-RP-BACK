@@ -2,6 +2,9 @@
 
 Reutilizado del backend demo. Añadido: filtro por máquinas y rango de fechas, indicadores (KPI)
 con comparación contra el periodo anterior, minutos de paro por día y MTBF por periodo.
+
+Todas las tablas se construyen con operaciones vectorizadas de pandas (sin `iterrows`) para que
+el payload mantenga el mismo orden y los mismos tipos nativos de Python.
 """
 from datetime import date, timedelta
 
@@ -68,13 +71,13 @@ def kpis(df: pd.DataFrame, full: pd.DataFrame, start: date, end: date) -> dict:
 
 def by_day(df: pd.DataFrame, start: date, end: date) -> list:
     """Minutos y paros por día, incluyendo los días sin paros (con 0)."""
-    days = pd.date_range(start, end, freq="D")
+    days = pd.date_range(start, end, freq="D", name="event_date")
     grouped = df.groupby("event_date").agg(minutes=("stop_minutes", "sum"), stops=("id", "count"))
-    grouped = grouped.reindex(days, fill_value=0)
-    return [
-        {"date": d.date().isoformat(), "minutes": float(round(r["minutes"], 2)), "stops": int(r["stops"])}
-        for d, r in grouped.iterrows()
-    ]
+    grouped = grouped.reindex(days, fill_value=0).reset_index()
+    grouped["date"] = grouped["event_date"].dt.strftime("%Y-%m-%d")
+    grouped["minutes"] = grouped["minutes"].round(2).astype(float)
+    grouped["stops"] = grouped["stops"].astype(int)
+    return grouped[["date", "minutes", "stops"]].to_dict("records")
 
 
 def by_day_machine(df: pd.DataFrame) -> list:
@@ -87,16 +90,11 @@ def by_day_machine(df: pd.DataFrame) -> list:
         .agg(count=("id", "count"), total_minutes=("stop_minutes", "sum"))
         .reset_index()
     )
-    return [
-        {
-            "date": r["event_date"].date().isoformat(),
-            "machine": r["machine"],
-            "count": int(r["count"]),
-            "total_minutes": float(round(r["total_minutes"], 2)),
-            "critical": r["machine"] in CRITICAL_MACHINES,
-        }
-        for _, r in grouped.iterrows()
-    ]
+    grouped["date"] = grouped["event_date"].dt.strftime("%Y-%m-%d")
+    grouped["count"] = grouped["count"].astype(int)
+    grouped["total_minutes"] = grouped["total_minutes"].round(2).astype(float)
+    grouped["critical"] = grouped["machine"].isin(CRITICAL_MACHINES).astype(bool)
+    return grouped[["date", "machine", "count", "total_minutes", "critical"]].to_dict("records")
 
 
 def available_periods(dates) -> dict:
@@ -123,17 +121,12 @@ def by_machine(df: pd.DataFrame) -> list:
         total_minutes=("stop_minutes", "sum"),
         avg_minutes=("stop_minutes", "mean"),
     )
-    grouped = grouped.sort_values("count", ascending=False)
-    return [
-        {
-            "machine": machine,
-            "count": int(row["count"]),
-            "total_minutes": float(round(row["total_minutes"], 2)),
-            "avg_minutes": float(round(row["avg_minutes"], 2)),
-            "critical": machine in CRITICAL_MACHINES,
-        }
-        for machine, row in grouped.iterrows()
-    ]
+    grouped = grouped.sort_values("count", ascending=False).reset_index()
+    grouped["count"] = grouped["count"].astype(int)
+    grouped["total_minutes"] = grouped["total_minutes"].round(2).astype(float)
+    grouped["avg_minutes"] = grouped["avg_minutes"].round(2).astype(float)
+    grouped["critical"] = grouped["machine"].isin(CRITICAL_MACHINES).astype(bool)
+    return grouped[["machine", "count", "total_minutes", "avg_minutes", "critical"]].to_dict("records")
 
 
 def top_failures(df: pd.DataFrame, n: int = 10) -> list:
@@ -145,17 +138,13 @@ def top_failures(df: pd.DataFrame, n: int = 10) -> list:
     )
     out = []
     for machine in sorted(df["machine"].unique(), key=lambda m: m in CRITICAL_MACHINES, reverse=True):
-        top = grouped[grouped["machine"] == machine].head(n)
-        out.extend(
-            {
-                "machine": machine,
-                "failure_type": r["failure_type"],
-                "count": int(r["count"]),
-                "total_minutes": float(round(r["total_minutes"], 2)),
-                "critical": machine in CRITICAL_MACHINES,
-            }
-            for _, r in top.iterrows()
-        )
+        top = grouped[grouped["machine"] == machine].head(n).copy()
+        if top.empty:
+            continue
+        top["count"] = top["count"].astype(int)
+        top["total_minutes"] = top["total_minutes"].round(2).astype(float)
+        top["critical"] = top["machine"].isin(CRITICAL_MACHINES).astype(bool)
+        out.extend(top[["machine", "failure_type", "count", "total_minutes", "critical"]].to_dict("records"))
     return out
 
 
@@ -167,16 +156,10 @@ def monthly_trend(df: pd.DataFrame) -> list:
         .agg(count=("id", "count"), total_minutes=("stop_minutes", "sum"))
         .reset_index()
     )
-    return [
-        {
-            "month": r["month"],
-            "machine": r["machine"],
-            "count": int(r["count"]),
-            "total_minutes": float(round(r["total_minutes"], 2)),
-            "critical": r["machine"] in CRITICAL_MACHINES,
-        }
-        for _, r in grouped.iterrows()
-    ]
+    grouped["count"] = grouped["count"].astype(int)
+    grouped["total_minutes"] = grouped["total_minutes"].round(2).astype(float)
+    grouped["critical"] = grouped["machine"].isin(CRITICAL_MACHINES).astype(bool)
+    return grouped[["month", "machine", "count", "total_minutes", "critical"]].to_dict("records")
 
 
 def by_shift(df: pd.DataFrame) -> list:
@@ -185,16 +168,11 @@ def by_shift(df: pd.DataFrame) -> list:
         .agg(count=("id", "count"), total_minutes=("stop_minutes", "sum"))
         .reset_index()
     )
-    return [
-        {
-            "shift": str(r["shift"]),
-            "machine": r["machine"],
-            "count": int(r["count"]),
-            "total_minutes": float(round(r["total_minutes"], 2)),
-            "critical": r["machine"] in CRITICAL_MACHINES,
-        }
-        for _, r in grouped.iterrows()
-    ]
+    grouped["shift"] = grouped["shift"].astype(str)
+    grouped["count"] = grouped["count"].astype(int)
+    grouped["total_minutes"] = grouped["total_minutes"].round(2).astype(float)
+    grouped["critical"] = grouped["machine"].isin(CRITICAL_MACHINES).astype(bool)
+    return grouped[["shift", "machine", "count", "total_minutes", "critical"]].to_dict("records")
 
 
 def avg_duration_by_failure(df: pd.DataFrame) -> list:
@@ -203,28 +181,21 @@ def avg_duration_by_failure(df: pd.DataFrame) -> list:
         .agg(avg_minutes=("stop_minutes", "mean"), count=("id", "count"))
         .reset_index()
     )
-    return [
-        {
-            "machine": r["machine"],
-            "failure_type": r["failure_type"],
-            "avg_minutes": float(round(r["avg_minutes"], 2)),
-            "count": int(r["count"]),
-        }
-        for _, r in grouped.iterrows()
-    ]
+    grouped["avg_minutes"] = grouped["avg_minutes"].round(2).astype(float)
+    grouped["count"] = grouped["count"].astype(int)
+    return grouped[["machine", "failure_type", "avg_minutes", "count"]].to_dict("records")
 
 
 def scatter(df: pd.DataFrame) -> list:
     subset = df[["machine", "stop_minutes", "efficiency_points_lost"]]
-    return [
-        {
-            "machine": r["machine"],
-            "stop_minutes": float(round(r["stop_minutes"], 2)),
-            "efficiency_points_lost": float(round(r["efficiency_points_lost"], 4)),
-            "critical": r["machine"] in CRITICAL_MACHINES,
-        }
-        for _, r in subset.iterrows()
-    ]
+    return (
+        subset.assign(
+            stop_minutes=subset["stop_minutes"].round(2).astype(float),
+            efficiency_points_lost=subset["efficiency_points_lost"].round(4).astype(float),
+            critical=subset["machine"].isin(CRITICAL_MACHINES).astype(bool),
+        )[["machine", "stop_minutes", "efficiency_points_lost", "critical"]]
+        .to_dict("records")
+    )
 
 
 def mtbf_by_machine(df: pd.DataFrame, start: date, end: date) -> list:

@@ -10,13 +10,9 @@ import re
 
 import pandas as pd
 
-from kof_engine import config as engine_config
-
-REQUIRED_COLUMNS = list(engine_config.COLUMNAS_REQUERIDAS)   # Fecha Contable, Turno, Intervalo, ...
 OPTIONAL_COLUMNS = ["Ptos. Efi. Perdid.", "Cajas Producidas"]
 
 SHEET_NAME = "BD SAP"
-FILTER_STOP_TYPE = engine_config.TIPO_PARO                   # "P.EQ.LINEA"
 
 EXCLUDED_ROWS = [
     "Inspector de nivel filtec L4-B",
@@ -49,17 +45,23 @@ def read_sap_file(path: str) -> pd.DataFrame:
 
 def load_and_filter(path: str, source_file: str) -> tuple[pd.DataFrame, int]:
     """Devuelve (registros limpios, cantidad de filas P.EQ.LINEA descartadas por datos inválidos)."""
+    # Import diferido: kof_engine arrastra scikit-learn y no debe cargarse al arrancar la API.
+    from kof_engine import config as engine_config
+
+    required_columns = list(engine_config.COLUMNAS_REQUERIDAS)   # Fecha Contable, Turno, Intervalo, ...
+    filter_stop_type = engine_config.TIPO_PARO                    # "P.EQ.LINEA"
+
     df = read_sap_file(path)
     df.columns = [str(c).strip() for c in df.columns]
 
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    missing = [c for c in required_columns if c not in df.columns]
     if missing:
         raise ValueError(f"Columnas requeridas no encontradas: {missing}")
     for col in OPTIONAL_COLUMNS:
         if col not in df.columns:
             df[col] = None
 
-    df = df[df["Tipo de Paro"].astype(str).str.strip() == FILTER_STOP_TYPE]
+    df = df[df["Tipo de Paro"].astype(str).str.strip() == filter_stop_type]
     df = df[~df["Clave de Paro"].isin(EXCLUDED_ROWS)]
     total = len(df)
 
