@@ -39,3 +39,10 @@ build/
 # Modelos entrenados (viven en la base de datos, no en el repo)
 *.joblib
 resultados.json
+
+# Datos del motor de planes (Excel SAP/ACR: nunca al repo público)
+motor_planes/datos/
+motor_planes/**/*.xlsx
+motor_planes/**/*.xls
+motor_planes/tmp/
+.motor-tmp/

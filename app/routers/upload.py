@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from .. import cache
+from .. import cache, motor_service
 from ..db import get_db
 from ..models import DataLoad, FailureEvent
 from ..prediction_service import create_run, run_engine
@@ -70,6 +70,8 @@ def upload_historical_file(background: BackgroundTasks, file: UploadFile = File(
     if inserted:
         run_id = create_run(db, trigger="upload").id
         background.add_task(run_engine, run_id, True)
+        # El motor de planes también necesita el histórico completo: se recalcula COMPLETA.
+        motor_service.encolar(db, trigger="upload", fases=motor_service.FASES_COMPLETA)
 
     return {
         "load_id": load.id,
