@@ -166,6 +166,9 @@ def _tareas_parada(db: Session, parada: Parada) -> list[dict]:
                 id_tarea = str(tarea.get("Id_tarea"))
                 if not id_tarea or id_tarea in vistos:
                     continue
+                # Una parada solo contiene lo que el usuario decidió.
+                if tarea.get("Estado") != "Enviada a la parada":
+                    continue
                 vistos.add(id_tarea)
                 tareas.append(_con_seguimiento(tarea, estado.get(id_tarea)))
 
