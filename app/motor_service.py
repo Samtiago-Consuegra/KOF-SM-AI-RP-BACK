@@ -70,6 +70,9 @@ TIPOS_ARCHIVO = {
 TIPOS_COMPLETA = {"avisos", "ordenes", "plan", "equivalencias"}
 TIPOS_ACR = {"consolidado", "acr", "acr_revisado"}
 
+# Caché local de los Excel de entrada: <id>_<nombre>. Sobrevive entre corridas.
+CACHE_ARCHIVOS = Path(tempfile.gettempdir()) / "kof_motor_archivos"
+
 SEMANA_RE = re.compile(r"^\d{4}-W\d{2}$")
 ACR_RE = re.compile(r"^\d{2}-\d{2}-\d{4}_.+\.xlsx?$", re.IGNORECASE)
 
@@ -379,29 +382,61 @@ class _EntradaArmada:
         return False
 
     def _copiar_archivos(self) -> None:
-        recientes: dict[str, MotorArchivo] = {}
-        for tipo in TIPOS_ARCHIVO - {"acr"}:
-            archivo = self.db.scalars(
-                select(MotorArchivo).where(MotorArchivo.tipo == tipo)
-                .order_by(MotorArchivo.subido_en.desc(), MotorArchivo.id.desc()).limit(1)
-            ).first()
-            if archivo is not None:
-                recientes[tipo] = archivo
-        for archivo in recientes.values():
-            destino = self.entrada / _nombre_canonico(archivo)
-            destino.write_bytes(archivo.data)
-
+        """Arma la entrada con los vigentes. Cada Excel se baja de la BD una sola vez y se
+        reutiliza desde CACHE_ARCHIVOS (los ids son inmutables: reemplazar crea un id nuevo)."""
         carpeta_acr = self.entrada / "acr"
         carpeta_acr.mkdir(exist_ok=True)
-        acrs = self.db.scalars(
-            select(MotorArchivo).where(MotorArchivo.tipo == "acr").order_by(MotorArchivo.id)
-        ).all()
-        for archivo in acrs:
+        CACHE_ARCHIVOS.mkdir(parents=True, exist_ok=True)
+
+        ids = ids_archivos_vigentes(self.db)
+        filas = self.db.execute(
+            select(MotorArchivo.id, MotorArchivo.tipo, MotorArchivo.nombre_archivo)
+            .where(MotorArchivo.id.in_(ids))
+        ).all() if ids else []
+
+        en_uso: set[str] = set()
+        for archivo in filas:
             nombre = Path(archivo.nombre_archivo).name
-            if not ACR_RE.match(nombre):
-                log.warning("ACR ignorado por nombre inválido: %s", nombre)
-                continue
-            (carpeta_acr / nombre).write_bytes(archivo.data)
+            local = CACHE_ARCHIVOS / f"{archivo.id}_{nombre}"
+            en_uso.add(local.name)
+            if not local.exists():
+                data = self.db.scalar(select(MotorArchivo.data).where(MotorArchivo.id == archivo.id))
+                tmp = local.with_name(local.name + ".tmp")
+                tmp.write_bytes(data)
+                tmp.replace(local)
+            destino = carpeta_acr / nombre if archivo.tipo == "acr" else self.entrada / _nombre_canonico(archivo)
+            shutil.copyfile(local, destino)
+
+        # Lo que ya no es vigente sale de la caché.
+        for viejo in CACHE_ARCHIVOS.iterdir():
+            if viejo.is_file() and viejo.name not in en_uso:
+                viejo.unlink(missing_ok=True)
+
+
+def ids_archivos_vigentes(db: Session) -> set[int]:
+    """Ids de los archivos que hoy usa el motor, con la misma regla de _copiar_archivos.
+
+    Solo consulta columnas ligeras: nunca carga data.
+    """
+    vigentes: set[int] = set()
+    for tipo in TIPOS_ARCHIVO - {"acr"}:
+        archivo_id = db.scalar(
+            select(MotorArchivo.id).where(MotorArchivo.tipo == tipo)
+            .order_by(MotorArchivo.subido_en.desc(), MotorArchivo.id.desc()).limit(1)
+        )
+        if archivo_id is not None:
+            vigentes.add(archivo_id)
+    # ACR: se copian por id ascendente; con nombre repetido gana el último (id mayor).
+    por_nombre: dict[str, int] = {}
+    for archivo_id, nombre in db.execute(
+        select(MotorArchivo.id, MotorArchivo.nombre_archivo)
+        .where(MotorArchivo.tipo == "acr").order_by(MotorArchivo.id)
+    ):
+        nombre = Path(nombre).name
+        if ACR_RE.match(nombre):
+            por_nombre[nombre] = archivo_id
+    vigentes.update(por_nombre.values())
+    return vigentes
 
 
 def _nombre_canonico(archivo: MotorArchivo) -> str:

@@ -1,7 +1,7 @@
 """Endpoints del motor de planes y de la Historia clínica."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from .. import motor_service
 from ..db import get_db
 from ..deps import get_current_user
-from ..models import DecisionTarea, HistoriaEvento, MotorArchivo, User
+from ..models import DataLoad, DecisionTarea, HistoriaEvento, MotorArchivo, User
 
 router = APIRouter(prefix="/motor", tags=["motor"])
 
@@ -93,18 +93,152 @@ def subir_archivo(
     return {"archivo": _archivo_dict(archivo), "run_id": run.id}
 
 
+SCRIPT_NOMBRE = "Carga inicial (script)"
+
+
+def _nombres(db: Session, correos) -> dict[str, str]:
+    """email -> full_name en una sola consulta."""
+    correos = {c for c in correos if c and not c.startswith("script:")}
+    if not correos:
+        return {}
+    return {email: nombre for email, nombre in db.execute(
+        select(User.email, User.full_name).where(User.email.in_(correos))) if nombre}
+
+
+def _nombre_de(correo: str | None, nombres: dict[str, str]) -> str | None:
+    if not correo:
+        return None
+    if correo.startswith("script:"):
+        return SCRIPT_NOMBRE
+    return nombres.get(correo, correo)
+
+
 @router.get("/archivos")
 def listar_archivos(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    vigentes: dict[str, dict | None] = {}
+    # data es diferida en el modelo: aquí solo viajan nombres y fechas.
+    recientes: dict[str, MotorArchivo | None] = {}
     for tipo in sorted(motor_service.TIPOS_ARCHIVO - {"acr"}):
-        archivo = db.scalars(select(MotorArchivo).where(MotorArchivo.tipo == tipo)
-                             .order_by(MotorArchivo.subido_en.desc(), MotorArchivo.id.desc())
-                             .limit(1)).first()
-        vigentes[tipo] = _archivo_dict(archivo) if archivo else None
-
+        recientes[tipo] = db.scalars(select(MotorArchivo).where(MotorArchivo.tipo == tipo)
+                                     .order_by(MotorArchivo.subido_en.desc(), MotorArchivo.id.desc())
+                                     .limit(1)).first()
     acr = db.scalars(select(MotorArchivo).where(MotorArchivo.tipo == "acr")
                      .order_by(MotorArchivo.subido_en.desc(), MotorArchivo.id.desc())).all()
-    return {"vigentes": vigentes, "acr": [_archivo_dict(a) for a in acr]}
+
+    nombres = _nombres(db, [a.subido_por for a in [*recientes.values(), *acr] if a])
+
+    def fila(a: MotorArchivo) -> dict:
+        return {**_archivo_dict(a), "subido_por_nombre": _nombre_de(a.subido_por, nombres)}
+
+    return {"vigentes": {t: fila(a) if a else None for t, a in recientes.items()},
+            "acr": [fila(a) for a in acr]}
+
+
+TipoArchivo = Literal["avisos", "ordenes", "plan", "consolidado", "acr", "acr_revisado", "equivalencias",
+                      "reporte_diario"]
+REPORTE_DIARIO = "reporte_diario"
+
+
+def _iso(valor) -> str | None:
+    return valor.isoformat() if valor else None
+
+
+@router.get("/archivos/historial")
+def historial_archivos(
+    tipo: TipoArchivo | None = Query(None),
+    desde: date | None = Query(None, description="AAAA-MM-DD sobre la fecha de carga"),
+    hasta: date | None = Query(None, description="AAAA-MM-DD sobre la fecha de carga (incluido)"),
+    buscar: str | None = Query(None),
+    pagina: int = Query(1, ge=1),
+    por_pagina: int = Query(8, ge=1, le=100),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    texto = buscar.strip().lower() if buscar and buscar.strip() else None
+    ini = datetime.combine(desde, time.min) if desde else None
+    fin = datetime.combine(hasta + timedelta(days=1), time.min) if hasta else None
+
+    def filtros_de(col_fecha, col_nombre) -> list:
+        f = []
+        if ini is not None:
+            f.append(col_fecha >= ini)
+        if fin is not None:
+            f.append(col_fecha < fin)
+        if texto:
+            f.append(func.lower(col_nombre).contains(texto))
+        return f
+
+    # Cada fuente aporta sus primeras pagina*por_pagina filas; se mezclan y se corta la página.
+    tope = pagina * por_pagina
+    usar_motor = tipo != REPORTE_DIARIO
+    usar_reporte = tipo in (None, REPORTE_DIARIO)
+
+    filas: list[tuple] = []  # (fecha, id, item)
+    total = 0
+
+    if usar_motor:
+        fm = filtros_de(MotorArchivo.subido_en, MotorArchivo.nombre_archivo)
+        if tipo:
+            fm.append(MotorArchivo.tipo == tipo)
+        total += int(db.scalar(select(func.count(MotorArchivo.id)).where(*fm)) or 0)
+        vigentes = motor_service.ids_archivos_vigentes(db)
+        for f in db.execute(
+            select(MotorArchivo.id, MotorArchivo.tipo, MotorArchivo.nombre_archivo,
+                   MotorArchivo.subido_en, MotorArchivo.subido_por,
+                   func.length(MotorArchivo.data).label("tamano_bytes"))
+            .where(*fm).order_by(MotorArchivo.subido_en.desc(), MotorArchivo.id.desc()).limit(tope)
+        ):
+            filas.append((f.subido_en, f.id, {
+                "id": f.id, "tipo": f.tipo, "nombre_archivo": f.nombre_archivo,
+                "subido_en": _iso(f.subido_en), "subido_por": f.subido_por,
+                "tamano_bytes": int(f.tamano_bytes or 0), "vigente": f.id in vigentes,
+            }))
+
+    if usar_reporte:
+        fr = filtros_de(DataLoad.uploaded_at, DataLoad.file_name)
+        total += int(db.scalar(select(func.count(DataLoad.id)).where(*fr)) or 0)
+        for d in db.execute(
+            select(DataLoad.id, DataLoad.file_name, DataLoad.uploaded_at, DataLoad.uploaded_by,
+                   DataLoad.file_size, DataLoad.records_inserted, DataLoad.records_duplicated,
+                   DataLoad.date_from, DataLoad.date_to)
+            .where(*fr).order_by(DataLoad.uploaded_at.desc(), DataLoad.id.desc()).limit(tope)
+        ):
+            filas.append((d.uploaded_at, d.id, {
+                "id": d.id, "tipo": REPORTE_DIARIO, "nombre_archivo": d.file_name,
+                "subido_en": _iso(d.uploaded_at), "subido_por": d.uploaded_by,
+                "tamano_bytes": d.file_size, "vigente": None,
+                "registros_insertados": d.records_inserted,
+                "registros_duplicados": d.records_duplicated,
+                "fecha_desde": _iso(d.date_from), "fecha_hasta": _iso(d.date_to),
+            }))
+
+    filas.sort(key=lambda t: (_orden_fecha(t[0]), t[1]), reverse=True)
+    items = [item for _, _, item in filas[(pagina - 1) * por_pagina: tope]]
+
+    nombres = _nombres(db, [i["subido_por"] for i in items])
+    for item in items:
+        item["subido_por_nombre"] = _nombre_de(item["subido_por"], nombres)
+
+    conteo = {t: 0 for t in sorted(motor_service.TIPOS_ARCHIVO)}
+    for t, n in db.execute(select(MotorArchivo.tipo, func.count(MotorArchivo.id)).group_by(MotorArchivo.tipo)):
+        conteo[t] = int(n)
+    conteo[REPORTE_DIARIO] = int(db.scalar(select(func.count(DataLoad.id))) or 0)
+
+    return {
+        "items": items,
+        "total": total,
+        "pagina": pagina,
+        "por_pagina": por_pagina,
+        "conteo_por_tipo": conteo,
+    }
+
+
+def _orden_fecha(valor) -> float:
+    """Clave comparable aunque una fuente traiga fechas con zona y otra sin ella."""
+    if valor is None:
+        return float("-inf")
+    if valor.tzinfo is None:
+        valor = valor.replace(tzinfo=timezone.utc)
+    return valor.timestamp()
 
 
 @router.get("/estado")

@@ -1,6 +1,7 @@
 from sqlalchemy import (JSON, Boolean, Column, Date, DateTime, ForeignKey, Integer, LargeBinary, Numeric,
                         String, Text, UniqueConstraint, func)
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import deferred
 
 from .db import Base
 
@@ -62,6 +63,8 @@ class DataLoad(Base):
     records_discarded = Column(Integer)
     date_from = Column(Date)
     date_to = Column(Date)
+    uploaded_by = Column(String(255))
+    file_size = Column(Integer)
 
 
 class ModelArtifact(Base):
@@ -112,7 +115,8 @@ class MotorArchivo(Base):
     id = Column(Integer, primary_key=True)
     tipo = Column(String(20), nullable=False, index=True)
     nombre_archivo = Column(String(255), nullable=False)
-    data = Column(LargeBinary, nullable=False)
+    # Diferida: los Excel pesan varios MB y solo el motor los necesita (lo pide explícitamente).
+    data = deferred(Column(LargeBinary, nullable=False))
     subido_en = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     subido_por = Column(String(255))
 

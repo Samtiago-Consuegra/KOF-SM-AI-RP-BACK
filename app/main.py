@@ -30,6 +30,9 @@ def _startup_worker() -> None:
         with engine.begin() as conn:
             for t in TABLES:
                 conn.execute(text(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"))
+            # create_all no altera tablas existentes: columnas nuevas de data_loads.
+            conn.execute(text("ALTER TABLE data_loads ADD COLUMN IF NOT EXISTS uploaded_by VARCHAR(255)"))
+            conn.execute(text("ALTER TABLE data_loads ADD COLUMN IF NOT EXISTS file_size INTEGER"))
         mark_interrupted_runs()
         motor_service.mark_interrupted_runs()
         motor_service.requeue_pending_runs()
