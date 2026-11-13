@@ -6,9 +6,10 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from .. import cache
+from .. import cache, motor_service
 from ..db import get_db
-from ..models import DataLoad, FailureEvent
+from ..deps import get_current_user
+from ..models import DataLoad, FailureEvent, User
 from ..prediction_service import create_run, run_engine
 from ..processing import load_and_filter
 
@@ -23,7 +24,8 @@ COLUMNS = ["row_key", "machine", "subsystem", "failure_type", "shift", "interval
 
 @router.post("/upload")
 def upload_historical_file(background: BackgroundTasks, file: UploadFile = File(...),
-                           db: Session = Depends(get_db)):
+                           db: Session = Depends(get_db),
+                           user: User = Depends(get_current_user)):
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED:
         raise HTTPException(status_code=400, detail="El archivo debe tener extensión .xlsx, .xls o .csv")
@@ -49,7 +51,8 @@ def upload_historical_file(background: BackgroundTasks, file: UploadFile = File(
         raise HTTPException(status_code=400, detail="No se encontraron registros P.EQ.LINEA válidos en el archivo")
 
     load = DataLoad(file_name=file.filename, records_found=len(df), records_discarded=discarded,
-                    date_from=df["event_date"].min(), date_to=df["event_date"].max())
+                    date_from=df["event_date"].min(), date_to=df["event_date"].max(),
+                    uploaded_by=user.email, file_size=len(content))
     db.add(load)
     db.flush()                                   # obtiene load.id sin cerrar la transacción
 
@@ -70,6 +73,8 @@ def upload_historical_file(background: BackgroundTasks, file: UploadFile = File(
     if inserted:
         run_id = create_run(db, trigger="upload").id
         background.add_task(run_engine, run_id, True)
+        # El motor de planes también necesita el histórico completo: se recalcula COMPLETA.
+        motor_service.encolar(db, trigger="upload", fases=motor_service.FASES_COMPLETA)
 
     return {
         "load_id": load.id,

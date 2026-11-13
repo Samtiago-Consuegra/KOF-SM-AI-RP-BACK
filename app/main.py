@@ -9,13 +9,16 @@ from sqlalchemy import text
 
 from .config import settings
 from .db import Base, engine
+from . import motor_service
 from .prediction_service import mark_interrupted_runs
-from .routers import auth, eda, predicciones, upload
+from .routers import auth, eda, motor, paradas, predicciones, upload
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kof.startup")
 
-TABLES = ["users", "failure_events", "data_loads", "model_artifacts", "prediction_runs"]
+TABLES = ["users", "failure_events", "data_loads", "model_artifacts", "prediction_runs",
+          "motor_archivos", "motor_runs", "motor_snapshots", "motor_salidas",
+          "historia_eventos", "paradas", "decision_tareas"]
 
 
 def _startup_worker() -> None:
@@ -27,7 +30,13 @@ def _startup_worker() -> None:
         with engine.begin() as conn:
             for t in TABLES:
                 conn.execute(text(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"))
+            # create_all no altera tablas existentes: columnas nuevas de data_loads.
+            conn.execute(text("ALTER TABLE data_loads ADD COLUMN IF NOT EXISTS uploaded_by VARCHAR(255)"))
+            conn.execute(text("ALTER TABLE data_loads ADD COLUMN IF NOT EXISTS file_size INTEGER"))
         mark_interrupted_runs()
+        motor_service.mark_interrupted_runs()
+        motor_service.requeue_pending_runs()
+        motor_service.start_worker()
         log.info("Inicialización de BD completada")
     except Exception:  # noqa: BLE001 - la API debe seguir arriba aunque falle la BD
         log.exception("Fallo al inicializar la base de datos en segundo plano")
@@ -64,3 +73,5 @@ app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(upload.router)
 app.include_router(eda.router)
 app.include_router(predicciones.router)
+app.include_router(motor.router)
+app.include_router(paradas.router)

@@ -1,0 +1,38 @@
+{
+  "paradas": [
+    {
+      "Id_parada": "PAR-2026-11-11-01",
+      "Titulo": "Cambio de formato 600 ml",
+      "Modalidad": "Frío",
+      "Fecha": "2026-11-11",
+      "Inicio": "05:00",
+      "Fin": "08:00",
+      "Maquinas": ["Llenadora", "Empacadora"],
+      "Tareas_manuales": [
+        {"Maquina": "Llenadora", "Sistema": "Sistema de Conjunto de llenado", "Id_componente": "LLE-001",
+         "Componente": "Válvula de llenado", "Tipo_tarea": "Preventiva",
+         "Tarea": "Revisar empaques de moneda en 10 válvulas", "Duracion_h": 1.0}
+      ]
+    },
+    {
+      "Id_parada": "PAR-2026-11-12-01",
+      "Titulo": "Saneamiento",
+      "Modalidad": "Caliente",
+      "Fecha": "2026-11-12",
+      "Inicio": "14:00",
+      "Fin": "16:00",
+      "Maquinas": ["Toda la línea"],
+      "Tareas_manuales": []
+    },
+    {
+      "Id_parada": "PAR-2026-11-14-01",
+      "Titulo": "Limpieza fin de semana",
+      "Modalidad": "Frío",
+      "Fecha": "2026-11-14",
+      "Inicio": "06:00",
+      "Fin": "14:00",
+      "Maquinas": ["Toda la línea"],
+      "Tareas_manuales": []
+    }
+  ]
+}
