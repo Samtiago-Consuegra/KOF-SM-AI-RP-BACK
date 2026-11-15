@@ -211,6 +211,8 @@ class Parada(Base):
     reprogramada_a_fecha = Column(Date)
     cumplida_parcial = Column(Boolean, nullable=False, default=False)
     avance_al_cumplir = Column(Integer)
+    ejecucion = Column(String(20), nullable=False, default="propio",
+                       server_default="propio")           # propio | contratista (solo app)
 
 
 class DecisionTarea(Base):

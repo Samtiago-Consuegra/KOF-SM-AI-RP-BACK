@@ -33,6 +33,8 @@ def _startup_worker() -> None:
             # create_all no altera tablas existentes: columnas nuevas de data_loads.
             conn.execute(text("ALTER TABLE data_loads ADD COLUMN IF NOT EXISTS uploaded_by VARCHAR(255)"))
             conn.execute(text("ALTER TABLE data_loads ADD COLUMN IF NOT EXISTS file_size INTEGER"))
+            conn.execute(text("ALTER TABLE paradas ADD COLUMN IF NOT EXISTS ejecucion VARCHAR(20) "
+                              "NOT NULL DEFAULT 'propio'"))
         mark_interrupted_runs()
         motor_service.mark_interrupted_runs()
         motor_service.requeue_pending_runs()

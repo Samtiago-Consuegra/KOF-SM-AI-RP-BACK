@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,16 @@ router = APIRouter(prefix="/paradas", tags=["paradas"])
 
 HORA_RE = re.compile(r"^\d{2}:\d{2}$")
 MODALIDADES = {"Frío", "Caliente"}
+FECHA_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+EJECUCIONES = ("propio", "contratista")
+CAMPOS_EDITABLES = {"Titulo": "titulo", "Modalidad": "modalidad", "Fecha": "fecha", "Inicio": "inicio",
+                    "Fin": "fin", "Maquinas": "maquinas", "Ejecucion": "ejecucion"}
+
+
+def _validar_ejecucion(valor):
+    if valor is not None and valor not in EJECUCIONES:
+        raise ValueError("Ejecucion debe ser 'propio' o 'contratista'")
+    return valor
 
 
 class TareaManualIn(BaseModel):
@@ -39,6 +49,9 @@ class ParadaIn(BaseModel):
     Fin: str
     Maquinas: list[str] = Field(default_factory=list)
     Tareas_manuales: list[TareaManualIn] = Field(default_factory=list)
+    Ejecucion: str = "propio"
+
+    _ejecucion = field_validator("Ejecucion")(_validar_ejecucion)
 
 
 class ParadaUpdate(BaseModel):
@@ -49,6 +62,16 @@ class ParadaUpdate(BaseModel):
     Fin: str | None = None
     Maquinas: list[str] | None = None
     Tareas_manuales: list[TareaManualIn] | None = None
+    Ejecucion: str | None = None
+
+    _ejecucion = field_validator("Ejecucion")(_validar_ejecucion)
+
+    @field_validator("Fecha", mode="before")
+    @classmethod
+    def _fecha_formato(cls, valor):
+        if valor is not None and not (isinstance(valor, str) and FECHA_RE.match(valor)):
+            raise ValueError("Fecha debe tener formato AAAA-MM-DD")
+        return valor
 
 
 class SeguimientoIn(BaseModel):
@@ -128,6 +151,7 @@ def _parada_dict(parada: Parada, tareas: list[dict] | None = None) -> dict:
         "reprogramada_a_fecha": parada.reprogramada_a_fecha.isoformat() if parada.reprogramada_a_fecha else None,
         "cumplida_parcial": bool(parada.cumplida_parcial),
         "avance_al_cumplir": parada.avance_al_cumplir,
+        "ejecucion": parada.ejecucion or "propio",
     }
     if tareas is not None:
         datos["tareas"] = tareas
@@ -210,10 +234,14 @@ def _fusionar_estado(actual: dict | None, nuevo: dict | None) -> dict:
 
 
 def _encolar_semanas(db: Session, semanas: list[str], trigger: str) -> list[int]:
+    """Suma todas las semanas al lote pendiente y despierta al worker una sola vez."""
     ids = []
     for semana in sorted({s for s in semanas if s}):
-        run = motor_service.encolar(db, trigger=trigger, fases=motor_service.FASES_PARADAS, semana=semana)
+        run = motor_service.encolar(db, trigger=trigger, fases=motor_service.FASES_PARADAS, semana=semana,
+                                    iniciar=False)
         ids.append(run.id)
+    if ids:
+        motor_service.start_worker()
     return ids
 
 
@@ -281,6 +309,7 @@ def crear_parada(
         fin=body.Fin,
         maquinas=body.Maquinas,
         tareas_manuales=[t.model_dump() for t in body.Tareas_manuales],
+        ejecucion=body.Ejecucion,
         creada_por=user.email,
         estado_base="Pendiente",
         tareas_estado={},
@@ -313,9 +342,9 @@ def editar_parada(
         raise HTTPException(status_code=400, detail="Indica al menos una máquina")
 
     semana_anterior = motor_service.semana_iso(parada.fecha)
-    for campo in ("Titulo", "Modalidad", "Fecha", "Inicio", "Fin", "Maquinas"):
-        if campo in datos and datos[campo] is not None:
-            setattr(parada, campo, datos[campo])
+    for campo, columna in CAMPOS_EDITABLES.items():
+        if datos.get(campo) is not None:
+            setattr(parada, columna, datos[campo])
     if "Tareas_manuales" in datos and datos["Tareas_manuales"] is not None:
         parada.tareas_manuales = datos["Tareas_manuales"]
     db.commit()
@@ -445,6 +474,7 @@ def cumplir_y_reprogramar(
         fin=body.Fin,
         maquinas=parada.maquinas or [],
         tareas_manuales=pendientes,
+        ejecucion=parada.ejecucion or "propio",
         creada_por=user.email,
         estado_base="Pendiente",
         tareas_estado={},
