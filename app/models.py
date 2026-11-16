@@ -182,6 +182,11 @@ class HistoriaEvento(Base):
     detalle = Column(Text)
     minutos_paro = Column(Numeric(10, 2))
     orden = Column(String(30))
+    # Columnas de la Historia clínica (main.py las agrega con ALTER TABLE si la tabla ya existía)
+    turno = Column(String(10))            # FALLA: turno en que empezó el paro
+    estado = Column(String(40))           # órdenes: Ejecutada | No ejecutada | Abierta | Otro
+    clase = Column(String(80))            # AVISO: tipo de aviso (Falla, Servicio...) · orden: clase SAP
+    plan = Column(String(40))             # PREVENTIVO: plan de mantenimiento SAP
 
 
 class Parada(Base):
@@ -211,8 +216,6 @@ class Parada(Base):
     reprogramada_a_fecha = Column(Date)
     cumplida_parcial = Column(Boolean, nullable=False, default=False)
     avance_al_cumplir = Column(Integer)
-    ejecucion = Column(String(20), nullable=False, default="propio",
-                       server_default="propio")           # propio | contratista (solo app)
 
 
 class DecisionTarea(Base):

@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from .. import motor_service
 from ..db import get_db
 from ..deps import get_current_user
-from ..models import DataLoad, DecisionTarea, HistoriaEvento, MotorArchivo, User
+from ..models import DataLoad, DecisionTarea, MotorArchivo, User
 
 router = APIRouter(prefix="/motor", tags=["motor"])
 
@@ -355,53 +355,6 @@ def alertas(
         run = motor_service.encolar(db, trigger="semana", fases=motor_service.FASES_SEMANA, semana=semana)
         return Response(content=_json_202(run.id), status_code=202, media_type="application/json")
     return contenido
-
-
-@router.get("/historia/eventos")
-def historia_eventos(
-    maquina: str | None = Query(None),
-    tipo: Literal["Todo", "FALLA", "PREVENTIVO", "CORRECTIVO", "AVISO"] = Query("Todo"),
-    desde: date | None = Query(None),
-    hasta: date | None = Query(None),
-    id_componente: str | None = Query(None),
-    pagina: int = Query(1, ge=1),
-    por_pagina: int = Query(50, ge=1, le=200),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
-):
-    filtros = []
-    if maquina:
-        filtros.append(HistoriaEvento.maquina == maquina)
-    if tipo != "Todo":
-        filtros.append(HistoriaEvento.tipo == tipo)
-    if desde:
-        filtros.append(HistoriaEvento.fecha >= desde)
-    if hasta:
-        filtros.append(HistoriaEvento.fecha <= hasta)
-    if id_componente:
-        filtros.append(HistoriaEvento.id_componente == id_componente)
-
-    total = int(db.scalar(select(func.count(HistoriaEvento.id)).where(*filtros)) or 0)
-    filas = db.scalars(
-        select(HistoriaEvento).where(*filtros)
-        .order_by(HistoriaEvento.fecha.desc(), HistoriaEvento.id.desc())
-        .offset((pagina - 1) * por_pagina).limit(por_pagina)
-    ).all()
-    return {
-        "total": total,
-        "pagina": pagina,
-        "por_pagina": por_pagina,
-        "eventos": [
-            {
-                "id": e.id, "maquina": e.maquina, "fecha": e.fecha.isoformat(), "tipo": e.tipo,
-                "id_componente": e.id_componente, "componente": e.componente, "sistema": e.sistema,
-                "titulo": e.titulo, "detalle": e.detalle,
-                "minutos_paro": float(e.minutos_paro) if e.minutos_paro is not None else None,
-                "orden": e.orden,
-            }
-            for e in filas
-        ],
-    }
 
 
 @router.post("/decisiones")

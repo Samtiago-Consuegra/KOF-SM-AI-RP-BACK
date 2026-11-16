@@ -11,7 +11,7 @@ from .config import settings
 from .db import Base, engine
 from . import motor_service
 from .prediction_service import mark_interrupted_runs
-from .routers import auth, eda, motor, paradas, predicciones, upload
+from .routers import auth, eda, historia, motor, paradas, predicciones, upload
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kof.startup")
@@ -33,8 +33,11 @@ def _startup_worker() -> None:
             # create_all no altera tablas existentes: columnas nuevas de data_loads.
             conn.execute(text("ALTER TABLE data_loads ADD COLUMN IF NOT EXISTS uploaded_by VARCHAR(255)"))
             conn.execute(text("ALTER TABLE data_loads ADD COLUMN IF NOT EXISTS file_size INTEGER"))
-            conn.execute(text("ALTER TABLE paradas ADD COLUMN IF NOT EXISTS ejecucion VARCHAR(20) "
-                              "NOT NULL DEFAULT 'propio'"))
+            # Columnas nuevas de historia_eventos (Historia clínica). Quedan vacías hasta la
+            # siguiente corrida completa del motor, que reconstruye la tabla.
+            for columna, tipo in (("turno", "VARCHAR(10)"), ("estado", "VARCHAR(40)"),
+                                  ("clase", "VARCHAR(80)"), ("plan", "VARCHAR(40)")):
+                conn.execute(text(f"ALTER TABLE historia_eventos ADD COLUMN IF NOT EXISTS {columna} {tipo}"))
         mark_interrupted_runs()
         motor_service.mark_interrupted_runs()
         motor_service.requeue_pending_runs()
@@ -75,5 +78,7 @@ app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(upload.router)
 app.include_router(eda.router)
 app.include_router(predicciones.router)
+# historia va antes que motor: sus rutas /motor/historia/... deben resolverse primero
+app.include_router(historia.router)
 app.include_router(motor.router)
 app.include_router(paradas.router)
