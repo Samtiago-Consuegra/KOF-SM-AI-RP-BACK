@@ -6,10 +6,11 @@ from datetime import date, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .. import cumplimiento_service as cs
 from .. import motor_service
 from ..db import get_db
 from ..deps import get_current_user
@@ -19,16 +20,6 @@ router = APIRouter(prefix="/paradas", tags=["paradas"])
 
 HORA_RE = re.compile(r"^\d{2}:\d{2}$")
 MODALIDADES = {"Frío", "Caliente"}
-FECHA_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-EJECUCIONES = ("propio", "contratista")
-CAMPOS_EDITABLES = {"Titulo": "titulo", "Modalidad": "modalidad", "Fecha": "fecha", "Inicio": "inicio",
-                    "Fin": "fin", "Maquinas": "maquinas", "Ejecucion": "ejecucion"}
-
-
-def _validar_ejecucion(valor):
-    if valor is not None and valor not in EJECUCIONES:
-        raise ValueError("Ejecucion debe ser 'propio' o 'contratista'")
-    return valor
 
 
 class TareaManualIn(BaseModel):
@@ -49,9 +40,6 @@ class ParadaIn(BaseModel):
     Fin: str
     Maquinas: list[str] = Field(default_factory=list)
     Tareas_manuales: list[TareaManualIn] = Field(default_factory=list)
-    Ejecucion: str = "propio"
-
-    _ejecucion = field_validator("Ejecucion")(_validar_ejecucion)
 
 
 class ParadaUpdate(BaseModel):
@@ -62,22 +50,13 @@ class ParadaUpdate(BaseModel):
     Fin: str | None = None
     Maquinas: list[str] | None = None
     Tareas_manuales: list[TareaManualIn] | None = None
-    Ejecucion: str | None = None
-
-    _ejecucion = field_validator("Ejecucion")(_validar_ejecucion)
-
-    @field_validator("Fecha", mode="before")
-    @classmethod
-    def _fecha_formato(cls, valor):
-        if valor is not None and not (isinstance(valor, str) and FECHA_RE.match(valor)):
-            raise ValueError("Fecha debe tener formato AAAA-MM-DD")
-        return valor
 
 
 class SeguimientoIn(BaseModel):
     tareas_estado: dict[str, dict] | None = None
     observaciones: str | None = None
     estado_base: Literal["Pendiente", "En proceso", "Cumplida"] | None = None
+    fin_real: str | None = None
 
 
 class CumplirIn(BaseModel):
@@ -151,68 +130,19 @@ def _parada_dict(parada: Parada, tareas: list[dict] | None = None) -> dict:
         "reprogramada_a_fecha": parada.reprogramada_a_fecha.isoformat() if parada.reprogramada_a_fecha else None,
         "cumplida_parcial": bool(parada.cumplida_parcial),
         "avance_al_cumplir": parada.avance_al_cumplir,
-        "ejecucion": parada.ejecucion or "propio",
     }
+    inicio, fin, fin_real = cs.momentos(parada)
+    datos["estado"] = cs.estado_efectivo(parada)          # Pendiente | En proceso | Vencida | Cumplida
+    datos["inicio_iso"] = inicio.isoformat()
+    datos["fin_iso"] = fin.isoformat()
+    datos["fin_real_iso"] = fin_real.isoformat() if fin_real else None
     if tareas is not None:
         datos["tareas"] = tareas
     return datos
 
 
-def _tarea_manual(parada: Parada, indice: int, tarea: dict) -> dict:
-    id_tarea = tarea.get("Id_tarea") or f"MAN-{parada.id_parada}-{indice + 1}"
-    return {
-        "Id_tarea": id_tarea,
-        "Maquina": tarea.get("Maquina"),
-        "Sistema": tarea.get("Sistema"),
-        "Id_componente": tarea.get("Id_componente"),
-        "Componente": tarea.get("Componente"),
-        "Tarea": tarea.get("Tarea"),
-        "Tipo_tarea": tarea.get("Tipo_tarea") or "Preventiva",
-        "Duracion_h": float(tarea.get("Duracion_h") or 0.5),
-        "Origen": "Registrada por el usuario",
-        "Estado": "Enviada a la parada",
-    }
-
-
-def _tareas_parada(db: Session, parada: Parada) -> list[dict]:
-    semana = motor_service.semana_iso(parada.fecha)
-    contenido = motor_service.get_salida(db, "plan_semanal", semana)
-    estado = parada.tareas_estado or {}
-    tareas: list[dict] = []
-    vistos: set[str] = set()
-
-    if contenido:
-        version = ((contenido.get("versiones") or {}).get("fusion") or {})
-        for item in version.get("paradas") or []:
-            if item.get("Id_parada") != parada.id_parada:
-                continue
-            for tarea in item.get("Tareas") or []:
-                id_tarea = str(tarea.get("Id_tarea"))
-                if not id_tarea or id_tarea in vistos:
-                    continue
-                # Una parada solo contiene lo que el usuario decidió.
-                if tarea.get("Estado") != "Enviada a la parada":
-                    continue
-                vistos.add(id_tarea)
-                tareas.append(_con_seguimiento(tarea, estado.get(id_tarea)))
-
-    for indice, tarea in enumerate(parada.tareas_manuales or []):
-        manual = _tarea_manual(parada, indice, tarea)
-        id_tarea = manual["Id_tarea"]
-        if id_tarea in vistos:
-            for existente in tareas:
-                if existente.get("Id_tarea") == id_tarea:
-                    existente.update(_con_seguimiento(existente, estado.get(id_tarea)))
-            continue
-        vistos.add(id_tarea)
-        tareas.append(_con_seguimiento(manual, estado.get(id_tarea)))
-    return tareas
-
-
-def _con_seguimiento(tarea: dict, seguimiento: dict | None) -> dict:
-    seguimiento = seguimiento or {}
-    return {**tarea, "Completada": bool(seguimiento.get("completada")),
-            "Comentario": seguimiento.get("comentario")}
+# Movidas a cumplimiento_service (también las usa el cálculo del cumplimiento).
+_tareas_parada = cs.tareas_parada
 
 
 def _avance(tareas: list[dict], estado: dict) -> int:
@@ -234,14 +164,10 @@ def _fusionar_estado(actual: dict | None, nuevo: dict | None) -> dict:
 
 
 def _encolar_semanas(db: Session, semanas: list[str], trigger: str) -> list[int]:
-    """Suma todas las semanas al lote pendiente y despierta al worker una sola vez."""
     ids = []
     for semana in sorted({s for s in semanas if s}):
-        run = motor_service.encolar(db, trigger=trigger, fases=motor_service.FASES_PARADAS, semana=semana,
-                                    iniciar=False)
+        run = motor_service.encolar(db, trigger=trigger, fases=motor_service.FASES_PARADAS, semana=semana)
         ids.append(run.id)
-    if ids:
-        motor_service.start_worker()
     return ids
 
 
@@ -249,7 +175,8 @@ def _normalizar_estado(valor: str | None) -> str | None:
     if not valor:
         return None
     mapa = {"pendiente": "Pendiente", "en_proceso": "En proceso", "en proceso": "En proceso",
-            "cumplida": "Cumplida"}
+            "en ejecución": "En proceso", "en ejecucion": "En proceso", "cumplida": "Cumplida",
+            "vencida": "Vencida"}
     return mapa.get(valor.strip().lower(), valor.strip())
 
 
@@ -261,7 +188,8 @@ def listar_paradas(
     desde: date | None = Query(None),
     hasta: date | None = Query(None),
     maquina: str | None = Query(None),
-    estado: str | None = Query(None),
+    estado: str | None = Query(None, description="Estado efectivo: Pendiente, En proceso, Vencida o Cumplida"),
+    incluir_tareas: bool = Query(False, description="Agrega las tareas de cada parada (tabla de Cumplimiento)"),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
@@ -270,13 +198,15 @@ def listar_paradas(
         consulta = consulta.where(Parada.fecha >= desde)
     if hasta:
         consulta = consulta.where(Parada.fecha <= hasta)
-    estado_base = _normalizar_estado(estado)
-    if estado_base:
-        consulta = consulta.where(Parada.estado_base == estado_base)
     paradas = db.scalars(consulta.order_by(Parada.fecha, Parada.inicio)).all()
     if maquina:
         paradas = [p for p in paradas if maquina in (p.maquinas or []) or "Toda la línea" in (p.maquinas or [])]
-    return [_parada_dict(p) for p in paradas]
+    # El estado se filtra sobre el estado efectivo: "Vencida" no se guarda, se calcula con la hora actual.
+    estado_buscado = _normalizar_estado(estado)
+    if estado_buscado:
+        ahora = cs.ahora_bogota()
+        paradas = [p for p in paradas if cs.estado_efectivo(p, ahora) == estado_buscado]
+    return [_parada_dict(p, _tareas_parada(db, p) if incluir_tareas else None) for p in paradas]
 
 
 @router.get("/{id_parada}")
@@ -309,7 +239,6 @@ def crear_parada(
         fin=body.Fin,
         maquinas=body.Maquinas,
         tareas_manuales=[t.model_dump() for t in body.Tareas_manuales],
-        ejecucion=body.Ejecucion,
         creada_por=user.email,
         estado_base="Pendiente",
         tareas_estado={},
@@ -342,9 +271,9 @@ def editar_parada(
         raise HTTPException(status_code=400, detail="Indica al menos una máquina")
 
     semana_anterior = motor_service.semana_iso(parada.fecha)
-    for campo, columna in CAMPOS_EDITABLES.items():
-        if datos.get(campo) is not None:
-            setattr(parada, columna, datos[campo])
+    for campo in ("Titulo", "Modalidad", "Fecha", "Inicio", "Fin", "Maquinas"):
+        if campo in datos and datos[campo] is not None:
+            setattr(parada, campo, datos[campo])
     if "Tareas_manuales" in datos and datos["Tareas_manuales"] is not None:
         parada.tareas_manuales = datos["Tareas_manuales"]
     db.commit()
@@ -384,11 +313,17 @@ def seguimiento(
     if parada is None:
         raise HTTPException(status_code=404, detail="Parada no encontrada")
 
+    if cs.estado_efectivo(parada) == "Vencida":
+        raise HTTPException(status_code=400, detail="Las paradas vencidas solo se pueden reprogramar")
+    if body.fin_real is not None and body.fin_real and not HORA_RE.match(body.fin_real):
+        raise HTTPException(status_code=400, detail="fin_real debe tener formato HH:MM")
     parada.tareas_estado = _fusionar_estado(parada.tareas_estado, body.tareas_estado)
     if body.observaciones is not None:
         parada.observaciones = body.observaciones
     if body.estado_base is not None:
         parada.estado_base = body.estado_base
+    if body.fin_real is not None:
+        parada.fin_real = body.fin_real or None
     db.commit()
     db.refresh(parada)
     run_ids = _encolar_semanas(db, [motor_service.semana_iso(parada.fecha)], "seguimiento")
@@ -406,19 +341,24 @@ def cumplir(
     if parada is None:
         raise HTTPException(status_code=404, detail="Parada no encontrada")
 
+    if body.fin_real and not HORA_RE.match(body.fin_real):
+        raise HTTPException(status_code=400, detail="fin_real debe tener formato HH:MM")
     tareas = _tareas_parada(db, parada)
-    parada.tareas_estado = _fusionar_estado(parada.tareas_estado, body.tareas_estado)
-    for tarea in tareas:
-        id_tarea = str(tarea.get("Id_tarea"))
-        entrada = dict(parada.tareas_estado.get(id_tarea) or {})
-        entrada["completada"] = True
-        parada.tareas_estado[id_tarea] = entrada
+    estado = _fusionar_estado(parada.tareas_estado, body.tareas_estado)
+    if body.tareas_estado is None:
+        # Sin detalle de tareas: cerrar la parada equivale a ejecutarlas todas (comportamiento anterior).
+        for tarea in tareas:
+            id_tarea = str(tarea.get("Id_tarea"))
+            estado[id_tarea] = {**(estado.get(id_tarea) or {}), "completada": True}
+    # Con detalle: se respeta lo marcado; si quedan tareas sin hacer, queda "cumplida parcial".
+    parada.tareas_estado = estado
+    avance = _avance(tareas, estado)
     if body.observaciones is not None:
         parada.observaciones = body.observaciones
     parada.estado_base = "Cumplida"
     parada.fin_real = body.fin_real or _ahora_hora()
-    parada.cumplida_parcial = False
-    parada.avance_al_cumplir = 100
+    parada.cumplida_parcial = avance < 100
+    parada.avance_al_cumplir = avance
     db.commit()
     db.refresh(parada)
     run_ids = _encolar_semanas(db, [motor_service.semana_iso(parada.fecha)], "cumplir")
@@ -460,10 +400,26 @@ def cumplir_y_reprogramar(
     parada.tareas_estado = estado
     parada.estado_base = "Cumplida"
     parada.fin_real = _ahora_hora()
-    parada.cumplida_parcial = bool(pendientes)
+    # Las restantes pasan a la parada nueva: esta queda cumplida con lo que se hizo.
+    parada.cumplida_parcial = False
     parada.avance_al_cumplir = avance
     if body.observaciones is not None:
         parada.observaciones = body.observaciones
+
+    if not pendientes:  # nada que reprogramar: es un cierre normal
+        db.commit()
+        db.refresh(parada)
+        run_ids = _encolar_semanas(db, [semana_anterior], "cumplir")
+        return {"parada_original": _parada_dict(parada, _tareas_parada(db, parada)),
+                "parada_nueva": None, "run_ids": run_ids}
+
+    historial = {
+        "fecha_anterior": parada.fecha.isoformat(), "inicio_anterior": parada.inicio, "fin_anterior": parada.fin,
+        "fecha_nueva": body.Fecha.isoformat(), "inicio_nuevo": body.Inicio, "fin_nuevo": body.Fin,
+        "motivo": "tareas-restantes", "avance": avance, "tareas_pendientes": len(pendientes),
+        "reprogramada_en": datetime.now(motor_service.BOGOTA).isoformat(), "reprogramada_por": user.email,
+    }
+    parada.historial_reprogramaciones = list(parada.historial_reprogramaciones or []) + [historial]
 
     nueva = Parada(
         id_parada=_nuevo_id(db, body.Fecha),
@@ -474,11 +430,10 @@ def cumplir_y_reprogramar(
         fin=body.Fin,
         maquinas=parada.maquinas or [],
         tareas_manuales=pendientes,
-        ejecucion=parada.ejecucion or "propio",
         creada_por=user.email,
         estado_base="Pendiente",
         tareas_estado={},
-        historial_reprogramaciones=[],
+        historial_reprogramaciones=[historial],
         parada_original_id=parada.id_parada,
         cumplida_parcial=False,
     )
@@ -513,6 +468,7 @@ def reprogramar(
 
     anterior = {"fecha": parada.fecha.isoformat(), "inicio": parada.inicio, "fin": parada.fin}
     semana_anterior = motor_service.semana_iso(parada.fecha)
+    tareas = _tareas_parada(db, parada)
     parada.historial_reprogramaciones = list(parada.historial_reprogramaciones or []) + [{
         "fecha_anterior": anterior["fecha"],
         "inicio_anterior": anterior["inicio"],
@@ -521,12 +477,19 @@ def reprogramar(
         "inicio_nuevo": body.Inicio,
         "fin_nuevo": body.Fin,
         "motivo": body.motivo,
+        "avance": cs.avance(tareas),
+        "tareas_pendientes": sum(1 for t in tareas if not t.get("Completada")),
+        "tareas_pendientes_por_maquina": cs.pendientes_por_maquina(tareas),  # cuentan como pospuestas
         "reprogramada_en": datetime.now(motor_service.BOGOTA).isoformat(),
         "reprogramada_por": user.email,
     }]
     parada.fecha = body.Fecha
     parada.inicio = body.Inicio
     parada.fin = body.Fin
+    # La parada vuelve a quedar abierta en su nueva fecha.
+    if parada.estado_base != "Cumplida":
+        parada.estado_base = "Pendiente"
+        parada.fin_real = None
     db.commit()
     db.refresh(parada)
 

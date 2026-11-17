@@ -11,7 +11,7 @@ from .config import settings
 from .db import Base, engine
 from . import motor_service
 from .prediction_service import mark_interrupted_runs
-from .routers import auth, eda, historia, motor, paradas, predicciones, upload
+from .routers import auth, cumplimiento, eda, historia, motor, paradas, predicciones, upload
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kof.startup")
@@ -82,3 +82,4 @@ app.include_router(predicciones.router)
 app.include_router(historia.router)
 app.include_router(motor.router)
 app.include_router(paradas.router)
+app.include_router(cumplimiento.router)
