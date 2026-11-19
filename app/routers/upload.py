@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from .. import cache, motor_service
+from .. import cache, cobertura_service, motor_service
 from ..db import get_db
 from ..deps import get_current_user
 from ..models import DataLoad, FailureEvent, User
@@ -67,6 +67,7 @@ def upload_historical_file(background: BackgroundTasks, file: UploadFile = File(
     load.records_duplicated = len(rows) - inserted
     db.commit()
     cache.invalidate()
+    cobertura_service.invalidate()
 
     # Hay datos nuevos → reentrenar y recalcular predicciones en segundo plano.
     run_id = None

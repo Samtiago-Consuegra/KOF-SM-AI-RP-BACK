@@ -1,5 +1,5 @@
-from sqlalchemy import (JSON, Boolean, Column, Date, DateTime, ForeignKey, Integer, LargeBinary, Numeric,
-                        String, Text, UniqueConstraint, func)
+from sqlalchemy import (JSON, Boolean, Column, Date, DateTime, ForeignKey, Index, Integer, LargeBinary,
+                        Numeric, String, Text, UniqueConstraint, func)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import deferred
 
@@ -187,6 +187,26 @@ class HistoriaEvento(Base):
     estado = Column(String(40))           # órdenes: Ejecutada | No ejecutada | Abierta | Otro
     clase = Column(String(80))            # AVISO: tipo de aviso (Falla, Servicio...) · orden: clase SAP
     plan = Column(String(40))             # PREVENTIVO: plan de mantenimiento SAP
+
+
+class OrdenSap(Base):
+    """Orden de trabajo SAP en alcance (ot_limpias.csv), para el calendario de semanas pasadas."""
+
+    __tablename__ = "ordenes_sap"
+    __table_args__ = (Index("ix_ordenes_sap_fecha_maquina", "fecha_programada", "maquina"),)
+
+    id = Column(Integer, primary_key=True)
+    orden = Column(String(30))
+    maquina = Column(String(50))
+    fecha_programada = Column(Date, index=True)
+    tipo_orden = Column(String(20))       # Preventiva | Correctiva | Predictiva | Emergencia | otro
+    plan = Column(String(40))
+    texto = Column(Text)
+    estado = Column(String(40))           # Ejecutada | No ejecutada | Abierta
+    estado_sap = Column(String(80))
+    equipo = Column(String(80))
+    costo_plan = Column(Numeric(14, 2))
+    costo_real = Column(Numeric(14, 2))
 
 
 class Parada(Base):

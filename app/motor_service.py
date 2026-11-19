@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from .db import SessionLocal
 from .models import (DecisionTarea, HistoriaEvento, MotorArchivo, MotorRun, MotorSalida,
-                     MotorSnapshot, Parada)
+                     MotorSnapshot, OrdenSap, Parada)
 from .prediction_service import _engine_lock
 
 log = logging.getLogger("kof.motor")
@@ -79,6 +79,7 @@ ACR_RE = re.compile(r"^\d{2}-\d{2}-\d{4}_.+\.xlsx?$", re.IGNORECASE)
 CACHE_MAX = 32
 _CACHE_LOCK = threading.RLock()
 _SALIDA_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_ORDENES_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 
 # ---------------------------------------------------------------------------
 # Cola: un hilo daemon, peticiones fusionadas
@@ -123,6 +124,17 @@ def normalizar_semana(semana: str | None) -> str:
     except ValueError as exc:
         raise ValueError(f"Semana ISO inválida: {semana}") from exc
     return semana
+
+
+def rango_semana(semana: str) -> tuple[date, date]:
+    """Lunes y domingo de una semana 'AAAA-Wnn' ya normalizada."""
+    anio, num = int(semana[:4]), int(semana[-2:])
+    return date.fromisocalendar(anio, num, 1), date.fromisocalendar(anio, num, 7)
+
+
+def semana_pasada(semana: str) -> bool:
+    """True si la semana terminó antes de hoy (hora de Bogotá)."""
+    return rango_semana(semana)[1] < hoy_bogota()
 
 
 def normalizar_fecha_ref(fecha: str | None) -> str:
@@ -621,6 +633,7 @@ def _guardar_salidas(db: Session, run_id: int, salida: Path, capturas: Path,
 
     if 13 in fases:
         _reemplazar_historia(db, salida)
+        _reemplazar_ordenes_sap(db, salida)
 
     if 12 in fases:
         _crear_snapshot(db, run_id, salida)
@@ -638,12 +651,102 @@ def _reemplazar_historia(db: Session, salida: Path) -> None:
         db.bulk_insert_mappings(HistoriaEvento, eventos)
 
 
+TIPOS_ORDEN = {"preventiva": "Preventiva", "correctiva": "Correctiva",
+               "predictiva": "Predictiva", "emergencia": "Emergencia"}
+
+
+def _columna(fila, *nombres):
+    for nombre in nombres:
+        if nombre in fila:
+            return fila[nombre]
+    return None
+
+
+def _reemplazar_ordenes_sap(db: Session, salida: Path) -> None:
+    """Reemplaza ordenes_sap con las OT en alcance de ot_limpias.csv (inserción masiva)."""
+    from .historia_service import _codigo, _fecha, _leer_csv, _num, _texto, _verdadero
+
+    ot = _leer_csv(salida, "ot_limpias.csv")
+    filas: list[dict] = []
+    if ot is not None and "En_alcance" in ot.columns:
+        ot = ot[ot["En_alcance"].map(_verdadero)]
+        for f in ot.to_dict("records"):
+            tipo = (_texto(f.get("Tipo_orden")) or "").lower()
+            filas.append({
+                "orden": _codigo(f.get("Orden")),
+                "maquina": _texto(f.get("Maquina")),
+                "fecha_programada": _fecha(f.get("Fecha_programada")),
+                "tipo_orden": TIPOS_ORDEN.get(tipo, "otro"),
+                "plan": _codigo(f.get("Plan")),
+                "texto": _texto(f.get("Texto")),
+                "estado": _texto(f.get("Estado")),
+                "estado_sap": _texto(_columna(f, "Estado_SAP", "Estado_sap", "Status_SAP", "Status")),
+                "equipo": _codigo(_columna(f, "Equipo", "Id_equipo")),
+                "costo_plan": _num(_columna(f, "Costo_plan", "Costo_planificado", "Costes_plan")),
+                "costo_real": _num(_columna(f, "Costo_real", "Costes_reales", "Costo_reales")),
+            })
+    db.execute(delete(OrdenSap))
+    if filas:
+        db.bulk_insert_mappings(OrdenSap, filas)
+
+
 # ---------------------------------------------------------------------------
 # Lectura con caché
 # ---------------------------------------------------------------------------
 def invalidate_cache() -> None:
     with _CACHE_LOCK:
         _SALIDA_CACHE.clear()
+        _ORDENES_CACHE.clear()
+    from . import cobertura_service  # import diferido: cobertura_service importa este módulo
+    cobertura_service.invalidate()
+
+
+def run_ok_vigente(db: Session) -> int | None:
+    return db.scalar(select(MotorRun.id).where(MotorRun.status == "ok")
+                     .order_by(MotorRun.id.desc()).limit(1))
+
+
+def get_ordenes_sap(db: Session, desde: date, hasta: date, maquina: str | None = None) -> dict:
+    """Órdenes del rango (consulta indexada por fecha) con resumen, cacheadas por run vigente."""
+    clave = (run_ok_vigente(db), desde, hasta, maquina)
+    with _CACHE_LOCK:
+        cacheado = _ORDENES_CACHE.get(clave)
+        if cacheado is not None:
+            _ORDENES_CACHE.move_to_end(clave)
+            return cacheado
+
+    c = OrdenSap
+    consulta = select(c.orden, c.maquina, c.fecha_programada, c.tipo_orden, c.plan, c.texto, c.estado,
+                      c.estado_sap, c.equipo, c.costo_plan, c.costo_real
+                      ).where(c.fecha_programada >= desde, c.fecha_programada <= hasta)
+    if maquina:
+        consulta = consulta.where(c.maquina == maquina)
+    consulta = consulta.order_by(c.fecha_programada, c.maquina, c.orden)
+
+    ordenes, por_tipo, por_estado = [], {}, {}
+    for f in db.execute(consulta):
+        ordenes.append({
+            "orden": f.orden, "maquina": f.maquina,
+            "fecha_programada": f.fecha_programada.isoformat() if f.fecha_programada else None,
+            "tipo_orden": f.tipo_orden, "plan": f.plan, "texto": f.texto, "estado": f.estado,
+            "estado_sap": f.estado_sap, "equipo": f.equipo,
+            "costo_plan": float(f.costo_plan) if f.costo_plan is not None else None,
+            "costo_real": float(f.costo_real) if f.costo_real is not None else None,
+        })
+        tipo, estado = f.tipo_orden or "otro", f.estado or "Sin estado"
+        por_tipo[tipo] = por_tipo.get(tipo, 0) + 1
+        por_estado[estado] = por_estado.get(estado, 0) + 1
+
+    respuesta = {
+        "desde": desde.isoformat(), "hasta": hasta.isoformat(), "maquina": maquina,
+        "ordenes": ordenes,
+        "resumen": {"total": len(ordenes), "por_tipo": por_tipo, "por_estado": por_estado},
+    }
+    with _CACHE_LOCK:
+        _ORDENES_CACHE[clave] = respuesta
+        while len(_ORDENES_CACHE) > CACHE_MAX:
+            _ORDENES_CACHE.popitem(last=False)
+    return respuesta
 
 
 def get_salida(db: Session, nombre: str, semana: str = "") -> dict | None:

@@ -11,14 +11,14 @@ from .config import settings
 from .db import Base, engine
 from . import motor_service
 from .prediction_service import mark_interrupted_runs
-from .routers import auth, cumplimiento, eda, historia, motor, paradas, predicciones, upload
+from .routers import auth, cobertura, cumplimiento, eda, historia, motor, paradas, predicciones, upload
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kof.startup")
 
 TABLES = ["users", "failure_events", "data_loads", "model_artifacts", "prediction_runs",
           "motor_archivos", "motor_runs", "motor_snapshots", "motor_salidas",
-          "historia_eventos", "paradas", "decision_tareas"]
+          "historia_eventos", "paradas", "decision_tareas", "ordenes_sap"]
 
 
 def _startup_worker() -> None:
@@ -38,6 +38,11 @@ def _startup_worker() -> None:
             for columna, tipo in (("turno", "VARCHAR(10)"), ("estado", "VARCHAR(40)"),
                                   ("clase", "VARCHAR(80)"), ("plan", "VARCHAR(40)")):
                 conn.execute(text(f"ALTER TABLE historia_eventos ADD COLUMN IF NOT EXISTS {columna} {tipo}"))
+            # Cumplimiento filtra paradas por fecha en SQL.
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_paradas_fecha ON paradas (fecha)"))
+            # GET /cobertura: MIN/MAX de las fechas de carga.
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_motor_archivos_subido_en ON motor_archivos (subido_en)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_data_loads_uploaded_at ON data_loads (uploaded_at)"))
         mark_interrupted_runs()
         motor_service.mark_interrupted_runs()
         motor_service.requeue_pending_runs()
@@ -83,3 +88,4 @@ app.include_router(historia.router)
 app.include_router(motor.router)
 app.include_router(paradas.router)
 app.include_router(cumplimiento.router)
+app.include_router(cobertura.router)

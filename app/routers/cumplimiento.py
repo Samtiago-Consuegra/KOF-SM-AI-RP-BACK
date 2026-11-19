@@ -48,6 +48,11 @@ def grafica(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    """Barras de la gráfica: programadas, ejecutadas, vencidas, pospuestas y % por máquina (y semana)."""
+    """Barras de la gráfica: programadas, ejecutadas, vencidas, pospuestas y % por máquina (y semana).
+
+    `por_tipo`: programadas del periodo y la máquina por clase (Preventiva, Correctiva, Predictiva).
+    """
     _validar(desde, hasta)
-    return {"filas": cs.por_maquina_y_semana(db, desde, hasta, maquina, agrupar)}
+    por_tipo: dict = {}
+    filas = cs.por_maquina_y_semana(db, desde, hasta, maquina, agrupar, por_tipo=por_tipo)
+    return {"filas": filas, "por_tipo": por_tipo}

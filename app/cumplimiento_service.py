@@ -14,11 +14,12 @@ Definiciones (documentarlas en el informe):
 """
 from __future__ import annotations
 
+import unicodedata
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import String, and_, cast, or_, select
+from sqlalchemy.orm import Session, defer
 
 from . import motor_service
 from .constants import CRITICAL_MACHINES
@@ -26,6 +27,9 @@ from .models import Parada
 
 MAQUINAS = list(CRITICAL_MACHINES)
 CAMPOS = ("programadas", "ejecutadas", "vencidas", "pospuestas")
+TIPOS = ("Preventiva", "Correctiva", "Predictiva")
+_TIPO_NORMAL = {"preventiva": "Preventiva", "correctiva": "Correctiva",
+                "predictiva": "Predictiva", "emergencia": "Correctiva"}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -53,10 +57,18 @@ def con_seguimiento(tarea: dict, seguimiento: dict | None) -> dict:
             "Comentario": seguimiento.get("comentario")}
 
 
-def tareas_parada(db: Session, parada: Parada) -> list[dict]:
-    """Tareas enviadas a la parada desde el plan semanal del motor + tareas manuales."""
+def tareas_parada(db: Session, parada: Parada, planes: dict | None = None) -> list[dict]:
+    """Tareas enviadas a la parada desde el plan semanal del motor + tareas manuales.
+
+    `planes` (opcional) memoriza el plan semanal por semana durante una petición.
+    """
     semana = motor_service.semana_iso(parada.fecha)
-    contenido = motor_service.get_salida(db, "plan_semanal", semana)
+    if planes is None:
+        contenido = motor_service.get_salida(db, "plan_semanal", semana)
+    else:
+        if semana not in planes:
+            planes[semana] = motor_service.get_salida(db, "plan_semanal", semana)
+        contenido = planes[semana]
     estado = parada.tareas_estado or {}
     tareas: list[dict] = []
     vistos: set[str] = set()
@@ -156,6 +168,21 @@ def _fecha_iso(valor) -> date | None:
         return None
 
 
+def _tipo_normal(valor) -> str | None:
+    texto = unicodedata.normalize("NFKD", str(valor or "")).encode("ascii", "ignore").decode()
+    return _TIPO_NORMAL.get(texto.strip().lower())
+
+
+def tipo_de_tarea(tarea: dict) -> str:
+    """Clase de la orden ("ZFI1 · Preventiva") → Tipo_tarea manual → Preventiva (planes del motor)."""
+    clase = str(tarea.get("Clase_orden") or "")
+    if "·" in clase:
+        tipo = _tipo_normal(clase.split("·", 1)[1])
+        if tipo:
+            return tipo
+    return _tipo_normal(tarea.get("Tipo_tarea")) or "Preventiva"
+
+
 def _vacio() -> dict:
     return {c: 0 for c in CAMPOS}
 
@@ -169,31 +196,51 @@ def _pct(fila: dict) -> float | None:
     return round(100 * fila["ejecutadas"] / fila["programadas"], 1) if fila["programadas"] else None
 
 
+def _paradas_del_rango(db: Session, desde: date | None, hasta: date | None) -> list[Parada]:
+    """Paradas que pueden aportar al periodo, en una sola consulta.
+
+    Las del rango por fecha, más las que tienen historial de reprogramaciones y se escribieron
+    después de `desde` (la fecha del movimiento nunca es posterior a actualizada_en; un día de
+    margen cubre UTC vs. Bogotá). Es un superconjunto: _registros aplica el filtro exacto.
+    """
+    consulta = select(Parada).options(defer(Parada.observaciones))
+    if desde is None and hasta is None:
+        return db.scalars(consulta).all()
+    en_rango = and_(*([Parada.fecha >= desde] if desde else []), *([Parada.fecha <= hasta] if hasta else []))
+    con_historial = cast(Parada.historial_reprogramaciones, String).notin_(["[]", "null"])
+    if desde is not None:
+        con_historial = and_(con_historial, Parada.actualizada_en >= desde - timedelta(days=1))
+    return db.scalars(consulta.where(or_(en_rango, con_historial))).all()
+
+
 def _registros(db: Session, desde: date | None, hasta: date | None, ahora: datetime):
     """Recorre las paradas y genera (fecha_del_conteo, maquina, conteos) para el periodo.
 
     Las pospuestas por "Reprogramar" se ubican en la fecha en que se reprogramó (la parada ya
     cambió de fecha); todo lo demás, en la fecha de la parada.
     """
-    paradas = db.scalars(select(Parada)).all()
-    for parada in paradas:
-        tareas = tareas_parada(db, parada)
+    planes: dict = {}  # plan semanal por semana, una lectura por petición
+    for parada in _paradas_del_rango(db, desde, hasta):
+        tareas = tareas_parada(db, parada, planes)
         estado = estado_efectivo(parada, ahora)
         movida_a_otra = bool(parada.reprogramada_a)  # "Cumplir y reprogramar restantes"
 
         if _entre(parada.fecha, desde, hasta):
             for maquina in _maquinas_de(tareas, parada):
                 fila = _vacio()
+                tipos = fila["_tipos"] = dict.fromkeys(TIPOS, 0)  # fuera de CAMPOS: no se suma en filas
                 for t in tareas:
                     if not _de_la_maquina(t, maquina):
                         continue
                     if t.get("Completada"):
                         fila["programadas"] += 1
                         fila["ejecutadas"] += 1
+                        tipos[tipo_de_tarea(t)] += 1
                     elif movida_a_otra:
                         fila["pospuestas"] += 1
                     else:
                         fila["programadas"] += 1
+                        tipos[tipo_de_tarea(t)] += 1
                         if estado == "Vencida":
                             fila["vencidas"] += 1
                 yield parada.fecha, maquina, fila
@@ -223,13 +270,23 @@ def resumen(db: Session, desde: date | None, hasta: date | None, maquina: str | 
 
 
 def por_maquina_y_semana(db: Session, desde: date | None, hasta: date | None, maquina: str | None = None,
-                         agrupar: str = "maquina", ahora: datetime | None = None) -> list[dict]:
-    """Filas para la gráfica: una por máquina (agrupar='maquina') o por semana y máquina ('semana')."""
+                         agrupar: str = "maquina", ahora: datetime | None = None,
+                         por_tipo: dict | None = None) -> list[dict]:
+    """Filas para la gráfica: una por máquina (agrupar='maquina') o por semana y máquina ('semana').
+
+    Si se pasa `por_tipo`, acumula ahí las programadas por tipo (mismo recorrido, sin consultas extra).
+    """
     grupos: dict[tuple, dict] = defaultdict(_vacio)
     maquinas = [maquina] if maquina else MAQUINAS
+    if por_tipo is not None:
+        for tipo in TIPOS:
+            por_tipo.setdefault(tipo, 0)
     for dia, m, fila in _registros(db, desde, hasta, ahora or ahora_bogota()):
         if m not in maquinas:
             continue
+        if por_tipo is not None:
+            for tipo, n in fila.get("_tipos", {}).items():
+                por_tipo[tipo] += n
         clave = (motor_service.semana_iso(dia) if agrupar == "semana" else None, m)
         _sumar(grupos[clave], fila)
 

@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .. import motor_service
+from .. import cobertura_service, motor_service
 from ..db import get_db
 from ..deps import get_current_user
 from ..models import DataLoad, DecisionTarea, MotorArchivo, User
@@ -86,6 +86,7 @@ def subir_archivo(
     archivo = MotorArchivo(tipo=tipo, nombre_archivo=nombre, data=contenido, subido_por=user.email)
     db.add(archivo)
     db.commit()
+    cobertura_service.invalidate()
     db.refresh(archivo)
 
     fases = motor_service.FASES_COMPLETA if tipo in motor_service.TIPOS_COMPLETA else motor_service.FASES_ACR
@@ -334,6 +335,8 @@ def plan_semanal(
     semana = _semana(semana)
     contenido = motor_service.get_salida(db, "plan_semanal", semana)
     if contenido is None:
+        if motor_service.semana_pasada(semana):
+            return _pasada(semana)
         if not motor_service.hay_run_ok(db):
             return _sin_datos()
         run = motor_service.encolar(db, trigger="semana", fases=motor_service.FASES_SEMANA, semana=semana)
@@ -350,11 +353,32 @@ def alertas(
     semana = _semana(semana)
     contenido = motor_service.get_salida(db, "alertas", semana)
     if contenido is None:
+        if motor_service.semana_pasada(semana):
+            return _pasada(semana)
         if not motor_service.hay_run_ok(db):
             return _sin_datos()
         run = motor_service.encolar(db, trigger="semana", fases=motor_service.FASES_SEMANA, semana=semana)
         return Response(content=_json_202(run.id), status_code=202, media_type="application/json")
     return contenido
+
+
+MAX_DIAS_ORDENES = 31
+
+
+@router.get("/ordenes-sap")
+def ordenes_sap(
+    desde: date = Query(..., description="AAAA-MM-DD"),
+    hasta: date = Query(..., description="AAAA-MM-DD (incluido)"),
+    maquina: str | None = Query(None),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    if hasta < desde:
+        raise HTTPException(status_code=422, detail="'hasta' debe ser igual o posterior a 'desde'")
+    if (hasta - desde).days + 1 > MAX_DIAS_ORDENES:
+        raise HTTPException(status_code=422, detail=f"El rango máximo es de {MAX_DIAS_ORDENES} días")
+    maquina = maquina.strip() if maquina and maquina.strip() else None
+    return motor_service.get_ordenes_sap(db, desde, hasta, maquina)
 
 
 @router.post("/decisiones")
@@ -416,6 +440,12 @@ def _json_202(run_id: int) -> bytes:
     import json
 
     return json.dumps({"status": "calculando", "run_id": run_id}).encode("utf-8")
+
+
+def _pasada(semana: str) -> dict:
+    """Semana ya terminada sin cálculo: no se encola el motor; el front muestra las órdenes SAP."""
+    desde, hasta = motor_service.rango_semana(semana)
+    return {"pasada": True, "semana": semana, "desde": desde.isoformat(), "hasta": hasta.isoformat()}
 
 
 def _semana(valor: str | None, desde_parada: str | None = None, db: Session | None = None) -> str:
